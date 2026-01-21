@@ -126,6 +126,7 @@ class EIPM(nn.Module):
 # ============================================================
 
 def rbf(X: Tensor, sigma: float) -> Tensor:
+    # X = X.contiguous()
     K = torch.exp(-torch.cdist(X, X) ** 2 / (2.0 * (sigma ** 2)))
     return K
 
@@ -146,7 +147,6 @@ def get_med(x: Tensor, max_n: int = 500) -> float:
     return float(torch.median(d).item())
 
 
-@torch.no_grad()
 @torch.no_grad()
 def h0_t( # h_0(t)
     T_train: torch.Tensor,          # (n_train,)
@@ -180,12 +180,13 @@ def h0_t( # h_0(t)
 #     return torch.exp(s - s_max)
 
 
-def compute_eipm_loss(model: nn.Module, X: Tensor, T: Tensor, a_sigma: float, h_T_vec: Tensor) -> Tensor:
+def compute_eipm_loss(model: nn.Module, X: Tensor, T: Tensor, a_sigma: float, a_h: float, k_nn: int) -> Tensor:
     r"""
     EIPM loss (empirical MMD^2 averaged over target indices i):
     For each target i (with t_i = T_i), define weights over j:
       w_{ij} =  K_T(t_i, T_j; h_loss) * exp(s_theta(X_j, T_j)) / \sum_{l} K_T(t_i, T_l; h_loss) * exp(s_theta(X_l, T_l)).
     """
+    h_T_vec = h0_t(T_train=T, t=T, a_h=float(a_h), k=int(k_nn))
     h_T_vec = h_T_vec.view(-1, 1)          # (n,1)
 
     s_val = model(X, T)                    # (n,)
@@ -293,14 +294,6 @@ def objective_cv_mse(
         splitter = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
         split_iter = splitter.split(np.arange(X_scaled.shape[0]))
 
-    with torch.no_grad():
-        h_T_full = h0_t(
-            T_train=T_scaled,
-            t=T_scaled,
-            a_h=float(a_h),
-            k=int(k_nn),
-        )
-
     fold_mse: List[float] = []
 
     for tr_idx, va_idx in split_iter:
@@ -310,32 +303,19 @@ def objective_cv_mse(
         X_tr, T_tr, Y_tr = X_scaled[tr], T_scaled[tr], Y[tr]
         X_va, T_va, Y_va = X_scaled[va], T_scaled[va], Y[va]
 
-        h_T_tr = h_T_full[tr]
-
         # inner training (short, for tuning)
         model = EIPM(input_dim=input_dim, hidden=width, n_layers=depth).to(device)
         opt = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
         for it in range(50):
             opt.zero_grad(set_to_none=True)
-            loss = compute_eipm_loss(model, X_tr, T_tr, a_sigma, h_T_tr)
+            loss = compute_eipm_loss(model, X_tr, T_tr, a_sigma, a_h, k_nn)
             if not torch.isfinite(loss):
-                with torch.no_grad():
-                    h_min = float(h_T_tr.min().item())
-                    h_med = float(torch.median(h_T_tr).item())
-                    h_max = float(h_T_tr.max().item())
-                    d_med = float(get_med(X_tr))
-                    sigma_dbg = float(a_sigma) * d_med
-                    t_min = float(T_tr.min().item())
-                    t_med = float(torch.median(T_tr).item())
-                    t_max = float(T_tr.max().item())
-                print(
-                    "[NANCHK][EIPM_LOSS] "
-                    f"trial={getattr(trial, 'number', 'NA')} fold=NA it={it} "
-                    f"a_sigma={a_sigma:.3g} a_h={a_h:.3g} k_nn={k_nn} lr={lr:.3g} wd={weight_decay:.3g} "
-                    f"T(min/med/max)=({t_min:.3g},{t_med:.3g},{t_max:.3g}) "
-                    f"h_T(min/med/max)=({h_min:.3g},{h_med:.3g},{h_max:.3g}) "
-                    f"sigma={sigma_dbg:.3g}"
+                raise RuntimeError(
+                    "EIPM loss is not finite: "
+                    f"trial={getattr(trial, 'number', 'NA')} it={it} "
+                    f"a_sigma={a_sigma:.3g} a_h={a_h:.3g} k_nn={k_nn} "
+                    f"lr={lr:.3g} wd={weight_decay:.3g}"
                 )
             loss.backward()
             opt.step()
@@ -393,16 +373,6 @@ def train_final_model_full(
         d_med = get_med(X_scaled)
         sigma = float(a_sigma) * float(d_med)
 
-    # loss bandwidth on T: query-wise h(t), evaluated at t = T_i
-    with torch.no_grad():
-        h_T = h0_t(
-            T_train=T_scaled,
-            t=T_scaled,
-            a_h=float(a_h),
-            k=int(k_nn),
-            q=0.5,
-        )
-
     model = EIPM(input_dim=input_dim, hidden=width, n_layers=depth).to(device)
     opt = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
@@ -412,7 +382,7 @@ def train_final_model_full(
     for _ in range(int(epochs)):
         model.train()
         opt.zero_grad(set_to_none=True)
-        loss = compute_eipm_loss(model, X_scaled, T_scaled, a_sigma, h_T)
+        loss = compute_eipm_loss(model, X_scaled, T_scaled, a_sigma, a_h, k_nn)
         loss.backward()
         opt.step()
 
@@ -431,7 +401,6 @@ def train_final_model_full(
             t=T_scaled,
             a_h=float(a_h),
             k=int(k_nn),
-            q=0.5,
         )
         h_median = float(torch.median(hq_rep).item())
 

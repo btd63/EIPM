@@ -103,12 +103,12 @@ class EIPM(nn.Module): # s_theta([x, t])가 속할 class임. d_X + 1 -> 128 -> -
 # ============================================================
 
 def rbf(X: Tensor, sigma: List[float]) -> Tensor: # RBF kernel 행렬 K n*n. (K_ij는 X_i, X_j에 대한 거리 기반 RBF kernel 값)
-    X = X.contiguous()
+    # X = X.contiguous()
     K = torch.exp(-torch.cdist(X, X)**2 / (2*sigma**2))
     return K
 
 @torch.no_grad()
-def get_med(x: Tensor, max_n: int) -> float:  # x((n,) or (n,d))를 넣으면, x_i, x_j 사이 거리의 median을 구해줌.
+def get_med(x: Tensor, max_n: int = 500) -> float:  # x((n,) or (n,d))를 넣으면, x_i, x_j 사이 거리의 median을 구해줌.
     if x.ndim == 1:
         x = x.view(-1, 1).contiguous()
     n = x.shape[0]
@@ -142,7 +142,7 @@ def h0_t( # h_0(t)
 def compute_eipm_loss(model: nn.Module, X: Tensor, T: Tensor, a_sigma : float, a_h : float, k_nn : int) -> Tensor:
     # MMD_k(hat P_{X|T=t}^{W_s}, hat P_X)
     # P_{X|T=t}^{W_s} = \sum_i a_i delta_{X_i}
-    h_T_vec = h_T_vec.view(-1, 1)          # (n,1)
+    h_T_vec = h0_t(T_train=T, t=T, a_h = a_h, k = k_nn)
 
     s_val = model(X, T)                    # (n,)
     s_max = torch.max(s_val)
