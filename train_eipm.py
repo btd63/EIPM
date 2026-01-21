@@ -147,26 +147,24 @@ def get_med(x: Tensor, max_n: int = 500) -> float:
 
 
 @torch.no_grad()
-def h0_t(  # h_0(t)
+@torch.no_grad()
+def h0_t( # h_0(t)
     T_train: torch.Tensor,          # (n_train,)
     t: torch.Tensor,                # (m,)
     *,
     a_h: float,
     k: int = 20,
-    q: float = 0.5,                 # quantile level (e.g., median)
-) -> torch.Tensor:  # (m,)
+) -> torch.Tensor: # (m,)
     T_tr = T_train.view(-1, 1)      # (n,1)
-    T_q = t.view(1, -1)             # (1,m)
+    T_q  = t.view(1, -1)      # (1,m)
     n = T_tr.shape[0]
-    m = T_q.shape[1]
     dist = torch.abs(T_tr - T_q)    # (n,m)
 
     # kNN radius (order statistic)
     dist_sorted, _ = torch.sort(dist, dim=0)  # (n,m)
-    k_eff = int(min(max(1, k), n - 1))        # 1..n-1
-    h_knn = a_h * dist_sorted[k_eff, :]       # (m,)
-    return h_knn.clamp_min(1e-6)
-
+    k_eff = min(k, n - 1)        # 1..n-1
+    h_knn = a_h * dist_sorted[k_eff, :]             # (m,)
+    return h_knn.view(-1, 1)
 
 # ============================================================
 # 3. EIPM loss
@@ -204,8 +202,8 @@ def compute_eipm_loss(model: nn.Module, X: Tensor, T: Tensor, a_sigma: float, h_
     sigma = a_sigma * d_med
     K_X = rbf(X, sigma)
 
-    denom = K_T @ exp_s.view(-1, 1)  # (n,1)
-    W_mat = (K_T * exp_s.view(1, -1)) / (denom.view(-1, 1) + 1e-8)  # (n,n)
+    denom = K_T @ W_s.view(-1, 1)  # (n,1)
+    W_mat = (K_T * W_s.view(1, -1)) / (denom.view(-1, 1) + 1e-8)  # (n,n)
 
     term1 = torch.sum((W_mat @ K_X) * W_mat, dim=1)  # (n,)
     term2 = torch.mean(K_X)
@@ -295,6 +293,14 @@ def objective_cv_mse(
         splitter = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
         split_iter = splitter.split(np.arange(X_scaled.shape[0]))
 
+    with torch.no_grad():
+        h_T_full = h0_t(
+            T_train=T_scaled,
+            t=T_scaled,
+            a_h=float(a_h),
+            k=int(k_nn),
+        )
+
     fold_mse: List[float] = []
 
     for tr_idx, va_idx in split_iter:
@@ -304,14 +310,7 @@ def objective_cv_mse(
         X_tr, T_tr, Y_tr = X_scaled[tr], T_scaled[tr], Y[tr]
         X_va, T_va, Y_va = X_scaled[va], T_scaled[va], Y[va]
 
-        # loss bandwidth on T: query-wise h(t), evaluated at t = T_i
-        h_T_tr = h0_t(
-            T_train=T_tr,
-            t=T_tr,
-            a_h=float(a_h),
-            k=int(k_nn),
-            q=0.5,
-        )
+        h_T_tr = h_T_full[tr]
 
         # inner training (short, for tuning)
         model = EIPM(input_dim=input_dim, hidden=width, n_layers=depth).to(device)
@@ -350,7 +349,6 @@ def objective_cv_mse(
             t=T_va,
             a_h=float(a_h),
             k=int(k_nn),
-            q=0.5,
         )
 
         preds = []
