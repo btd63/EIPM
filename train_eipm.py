@@ -164,7 +164,7 @@ def h0_t( # h_0(t)
     dist_sorted, _ = torch.sort(dist, dim=0)  # (n,m)
     k_eff = min(k, n - 1)        # 1..n-1
     h_knn = a_h * dist_sorted[k_eff, :]             # (m,)
-    return h_knn.view(-1, 1)
+    return h_knn.clamp_min(1e-8).view(-1, 1)
 
 # ============================================================
 # 3. EIPM loss
@@ -237,8 +237,11 @@ def mu_hat_at_t(
     s_max = torch.max(s_tr)
     W_s_tr = torch.exp(s_tr-s_max)            # (n,)
 
+    hq = float(h_query)
+    if hq < 1e-8:
+        hq = 1e-8
     diff_sq = (T_train.view(-1) - t.view(())) ** 2
-    K = torch.exp(-0.5 * diff_sq / (float(h_query) ** 2))
+    K = torch.exp(-0.5 * diff_sq / (hq ** 2))
 
     w_unnorm = K * W_s_tr
     denom = torch.sum(w_unnorm) + 1e-8
@@ -261,8 +264,10 @@ def objective_cv_mse(
     device: torch.device,
     depth: int,
     width: int,
+    tune_steps: int = 50,
     n_splits: int = 5,
     seed: int = 42,
+    profile: bool = False,
 ) -> float:
     """
     Tune hyperparameters by K-fold CV on the TRAIN set only.
@@ -295,8 +300,12 @@ def objective_cv_mse(
         split_iter = splitter.split(np.arange(X_scaled.shape[0]))
 
     fold_mse: List[float] = []
+    t_fold_total = 0.0
+    t_train_total = 0.0
+    t_pred_total = 0.0
 
     for tr_idx, va_idx in split_iter:
+        t_fold0 = time.perf_counter()
         tr = torch.as_tensor(tr_idx, device=device, dtype=torch.long)
         va = torch.as_tensor(va_idx, device=device, dtype=torch.long)
 
@@ -307,18 +316,28 @@ def objective_cv_mse(
         model = EIPM(input_dim=input_dim, hidden=width, n_layers=depth).to(device)
         opt = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
-        for it in range(50):
+        t_train0 = time.perf_counter()
+        for it in range(int(tune_steps)):
             opt.zero_grad(set_to_none=True)
             loss = compute_eipm_loss(model, X_tr, T_tr, a_sigma, a_h, k_nn)
             if not torch.isfinite(loss):
+                with torch.no_grad():
+                    h_dbg = h0_t(T_train=T_tr, t=T_tr, a_h=float(a_h), k=int(k_nn)).view(-1)
+                    h_min = float(h_dbg.min().item())
+                    h_med = float(torch.median(h_dbg).item())
+                    h_max = float(h_dbg.max().item())
+                    h_zeros = int((h_dbg == 0).sum().item())
                 raise RuntimeError(
                     "EIPM loss is not finite: "
                     f"trial={getattr(trial, 'number', 'NA')} it={it} "
                     f"a_sigma={a_sigma:.3g} a_h={a_h:.3g} k_nn={k_nn} "
-                    f"lr={lr:.3g} wd={weight_decay:.3g}"
+                    f"lr={lr:.3g} wd={weight_decay:.3g} "
+                    f"h(min/med/max)=({h_min:.3g},{h_med:.3g},{h_max:.3g}) "
+                    f"h_zeros={h_zeros}"
                 )
             loss.backward()
             opt.step()
+        t_train_total += time.perf_counter() - t_train0
 
         model.eval()
 
@@ -331,15 +350,28 @@ def objective_cv_mse(
             k=int(k_nn),
         )
 
+        t_pred0 = time.perf_counter()
         preds = []
         for i in range(T_va.numel()):
-            preds.append(mu_hat_at_t(model, X_tr, T_tr, Y_tr, T_va[i], float(hq[i].item())))
+            mu_i = mu_hat_at_t(model, X_tr, T_tr, Y_tr, T_va[i], float(hq[i].item()))
+            preds.append(mu_i)
 
         pred = torch.stack(preds).view(-1)
         mse = torch.mean((pred - Y_va.view(-1)) ** 2).item()
         fold_mse.append(float(mse))
+        t_pred_total += time.perf_counter() - t_pred0
+        t_fold_total += time.perf_counter() - t_fold0
 
-    return float(np.mean(fold_mse))
+    result = float(np.mean(fold_mse))
+    if profile and t_fold_total > 0.0:
+        print(
+            "[PROFILE][CV] "
+            f"folds={n_splits} "
+            f"train={t_train_total:.3f}s "
+            f"pred={t_pred_total:.3f}s "
+            f"total={t_fold_total:.3f}s"
+        )
+    return result
 
 
 # ============================================================
@@ -657,6 +689,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n_trials", type=int, default=25)
     p.add_argument("--k_folds", type=int, default=5)
     p.add_argument("--tune_rep_idx", type=int, default=0)
+    p.add_argument("--tune_steps", type=int, default=50)
+    p.add_argument("--only_first_file", action="store_true")
+    p.add_argument("--only_first_rep", action="store_true")
+    p.add_argument("--profile", action="store_true")
 
     # Reproducibility
     p.add_argument("--seed", type=int, default=42)
@@ -703,7 +739,12 @@ def main() -> None:
     train_times: List[float] = []
 
     for file_idx_1based, npz_path in enumerate(files, start=1):
+        if args.only_first_file and file_idx_1based > 1:
+            break
+        t_file0 = time.perf_counter()
         reps = load_replications_from_npz(npz_path)
+        if args.profile:
+            print(f"[PROFILE] load_replications: {Path(npz_path).name} {time.perf_counter() - t_file0:.3f}s")
 
         if len(reps) == 0:
             continue
@@ -722,6 +763,8 @@ def main() -> None:
             continue
 
         for rep in reps_to_run:
+            if args.only_first_rep and rep.rep_idx > 0:
+                break
             ckpt_path = make_ckpt_path(out_dir, npz_path, rep.rep_idx, depth, width)
 
             hp_path = make_hp_path(out_dir, npz_path, rep.rep_idx, depth, width)
@@ -737,6 +780,7 @@ def main() -> None:
             input_dim = int(rep.d_X) + 1
 
             if best_params is None or best_value is None:
+                t_tune0 = time.perf_counter()
                 X_tune = torch.tensor(rep.Xtilde, dtype=torch.float32, device=device)
                 T_tune = torch.tensor(rep.tildeT, dtype=torch.float32, device=device)
                 Y_tune = torch.tensor(rep.Y, dtype=torch.float32, device=device)
@@ -754,14 +798,15 @@ def main() -> None:
                         device=device,
                         depth=depth,
                         width=width,
+                        tune_steps=int(args.tune_steps),
                         n_splits=int(args.k_folds),
                         seed=int(args.seed),
+                        profile=bool(args.profile),
                     )
 
-                t_tune0 = time.time()
                 study = optuna.create_study(direction="minimize")
                 study.optimize(_obj, n_trials=int(args.n_trials), show_progress_bar=False)
-                t_tune1 = time.time()
+                t_tune1 = time.perf_counter()
 
                 best_params = study.best_params
                 best_value = float(study.best_value)
@@ -778,6 +823,8 @@ def main() -> None:
 
                 tune_times.append(t_tune1 - t_tune0)
                 done_tune += 1
+                if args.profile:
+                    print(f"[PROFILE] tune_rep: rep={rep.rep_idx} {t_tune1 - t_tune0:.3f}s")
 
             X = torch.tensor(rep.Xtilde, dtype=torch.float32, device=device)
             T = torch.tensor(rep.tildeT, dtype=torch.float32, device=device)
@@ -786,7 +833,7 @@ def main() -> None:
             X_scaled = X / math.sqrt(float(rep.d_X))
             T_scaled = T.view(-1)
 
-            t_train0 = time.time()
+            t_train0 = time.perf_counter()
             model, train_stats = train_final_model_full(
                 X_scaled=X_scaled,
                 T_scaled=T_scaled,
@@ -799,7 +846,9 @@ def main() -> None:
                 seed=int(args.seed),
                 epochs=int(args.epochs),
             )
-            t_train1 = time.time()
+            t_train1 = time.perf_counter()
+            if args.profile:
+                print(f"[PROFILE] train_rep: rep={rep.rep_idx} {t_train1 - t_train0:.3f}s")
 
             atomic_torch_save(
                 ckpt_path,

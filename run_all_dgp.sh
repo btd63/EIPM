@@ -8,12 +8,12 @@ SCRIPT=my_dgp.py
 # Fixed settings
 # ----------------------------
 N_EVAL=10000
-N_RPT=200
+N_RPT=100
 SEED=42
 
 N_TRAIN_LIST=(250 500 1000 2000)
 SCENARIOS=(linear nonlinear)
-PI_0S=(0.0 0.2 0.5 0.8)
+PI_0S=(0.0 0.2 0.8)
 echo "=== Running all DGP combinations ==="
 
 #######################################
