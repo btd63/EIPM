@@ -264,10 +264,11 @@ def objective_cv_mse(
     device: torch.device,
     depth: int,
     width: int,
-    tune_steps: int = 50,
+    max_steps: int = 500,
+    patience: int = 3,
+    min_delta: float = 1e-3,
     n_splits: int = 5,
     seed: int = 42,
-    profile: bool = False,
 ) -> float:
     """
     Tune hyperparameters by K-fold CV on the TRAIN set only.
@@ -299,13 +300,10 @@ def objective_cv_mse(
         splitter = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
         split_iter = splitter.split(np.arange(X_scaled.shape[0]))
 
+    eval_every = 1
     fold_mse: List[float] = []
-    t_fold_total = 0.0
-    t_train_total = 0.0
-    t_pred_total = 0.0
 
-    for tr_idx, va_idx in split_iter:
-        t_fold0 = time.perf_counter()
+    for fold_i, (tr_idx, va_idx) in enumerate(split_iter, start=1):
         tr = torch.as_tensor(tr_idx, device=device, dtype=torch.long)
         va = torch.as_tensor(va_idx, device=device, dtype=torch.long)
 
@@ -316,8 +314,9 @@ def objective_cv_mse(
         model = EIPM(input_dim=input_dim, hidden=width, n_layers=depth).to(device)
         opt = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
-        t_train0 = time.perf_counter()
-        for it in range(int(tune_steps)):
+        best_mse = float("inf")
+        no_improve = 0
+        for it in range(int(max_steps)):
             opt.zero_grad(set_to_none=True)
             loss = compute_eipm_loss(model, X_tr, T_tr, a_sigma, a_h, k_nn)
             if not torch.isfinite(loss):
@@ -337,40 +336,62 @@ def objective_cv_mse(
                 )
             loss.backward()
             opt.step()
-        t_train_total += time.perf_counter() - t_train0
+            if (it + 1) % eval_every == 0:
+                model.eval()
+                if fold_i == 1:
+                    with torch.no_grad():
+                        s_tmp = model(X_tr, T_tr).view(-1)
+                        s_range = float(s_tmp.max().item() - s_tmp.min().item())
+                        s_std = float(s_tmp.std().item())
+                        s_max = torch.max(s_tmp)
+                        w_tmp = torch.exp(s_tmp - s_max)
+                        w_range = float(w_tmp.max().item() - w_tmp.min().item())
+                        w_std = float(w_tmp.std().item())
+                    print(
+                        f"[SVAL] step={it + 1} "
+                        f"s_range={s_range:.3g} s_std={s_std:.3g} "
+                        f"w_range={w_range:.3g} w_std={w_std:.3g}"
+                    )
+                hq = h0_t(
+                    T_train=T_tr,
+                    t=T_va,
+                    a_h=float(a_h),
+                    k=int(k_nn),
+                )
 
-        model.eval()
+                preds = []
+                for i in range(T_va.numel()):
+                    mu_i = mu_hat_at_t(model, X_tr, T_tr, Y_tr, T_va[i], float(hq[i].item()))
+                    preds.append(mu_i)
+                pred = torch.stack(preds).view(-1)
+                mse = torch.mean((pred - Y_va.view(-1)) ** 2).item()
 
-        # validation prediction: \hat{\mu}(T_va[i]) using train-fold data only
-        # query-wise bandwidth: h(t) = a_h * h0(t)
-        hq = h0_t(
-            T_train=T_tr,
-            t=T_va,
-            a_h=float(a_h),
-            k=int(k_nn),
-        )
+                if mse < best_mse - float(min_delta):
+                    best_mse = float(mse)
+                    no_improve = 0
+                else:
+                    no_improve += 1
+                model.train()
+                if no_improve >= int(patience):
+                    break
+        if best_mse == float("inf"):
+            model.eval()
+            hq = h0_t(
+                T_train=T_tr,
+                t=T_va,
+                a_h=float(a_h),
+                k=int(k_nn),
+            )
+            preds = []
+            for i in range(T_va.numel()):
+                mu_i = mu_hat_at_t(model, X_tr, T_tr, Y_tr, T_va[i], float(hq[i].item()))
+                preds.append(mu_i)
+            pred = torch.stack(preds).view(-1)
+            best_mse = float(torch.mean((pred - Y_va.view(-1)) ** 2).item())
 
-        t_pred0 = time.perf_counter()
-        preds = []
-        for i in range(T_va.numel()):
-            mu_i = mu_hat_at_t(model, X_tr, T_tr, Y_tr, T_va[i], float(hq[i].item()))
-            preds.append(mu_i)
-
-        pred = torch.stack(preds).view(-1)
-        mse = torch.mean((pred - Y_va.view(-1)) ** 2).item()
-        fold_mse.append(float(mse))
-        t_pred_total += time.perf_counter() - t_pred0
-        t_fold_total += time.perf_counter() - t_fold0
+        fold_mse.append(float(best_mse))
 
     result = float(np.mean(fold_mse))
-    if profile and t_fold_total > 0.0:
-        print(
-            "[PROFILE][CV] "
-            f"folds={n_splits} "
-            f"train={t_train_total:.3f}s "
-            f"pred={t_pred_total:.3f}s "
-            f"total={t_fold_total:.3f}s"
-        )
     return result
 
 
@@ -387,6 +408,7 @@ def train_final_model_full(
     best_params: Dict,
     depth: int,
     width: int,
+    k_folds: int,
     seed: int = 42,
     epochs: int = 300,
 ) -> Tuple[nn.Module, Dict[str, float]]:
@@ -405,16 +427,19 @@ def train_final_model_full(
         d_med = get_med(X_scaled)
         sigma = float(a_sigma) * float(d_med)
 
+    n = int(X_scaled.shape[0])
+    splitter = KFold(n_splits=int(k_folds), shuffle=True, random_state=seed)
+
     model = EIPM(input_dim=input_dim, hidden=width, n_layers=depth).to(device)
     opt = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     best_loss = float("inf")
     best_state = None
 
-    for _ in range(int(epochs)):
+    for ep in range(int(epochs)):
         model.train()
         opt.zero_grad(set_to_none=True)
-        loss = compute_eipm_loss(model, X_scaled, T_scaled, a_sigma, a_h, k_nn)
+        loss = compute_eipm_loss(model, X_tr, T_tr, a_sigma, a_h, k_nn)
         loss.backward()
         opt.step()
 
@@ -422,6 +447,44 @@ def train_final_model_full(
         if lval < best_loss:
             best_loss = lval
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+        # per-epoch diagnostics (val EIPM + val MSE via KFold)
+        model.eval()
+        with torch.no_grad():
+            val_eipm_sum = 0.0
+            val_mse_sum = 0.0
+            n_folds = 0
+            for tr_idx, va_idx in splitter.split(np.arange(n)):
+                tr = torch.as_tensor(tr_idx, device=device, dtype=torch.long)
+                va = torch.as_tensor(va_idx, device=device, dtype=torch.long)
+                X_tr, T_tr, Y_tr = X_scaled[tr], T_scaled[tr], Y[tr]
+                X_va, T_va, Y_va = X_scaled[va], T_scaled[va], Y[va]
+
+                val_eipm = compute_eipm_loss(model, X_va, T_va, a_sigma, a_h, k_nn)
+                hq = h0_t(
+                    T_train=T_tr,
+                    t=T_va,
+                    a_h=float(a_h),
+                    k=int(k_nn),
+                )
+                preds = []
+                for i in range(T_va.numel()):
+                    preds.append(mu_hat_at_t(model, X_tr, T_tr, Y_tr, T_va[i], float(hq[i].item())))
+                pred = torch.stack(preds).view(-1)
+                val_mse = torch.mean((pred - Y_va.view(-1)) ** 2)
+
+                val_eipm_sum += float(val_eipm.item())
+                val_mse_sum += float(val_mse.item())
+                n_folds += 1
+
+            val_eipm_avg = val_eipm_sum / max(1, n_folds)
+            val_mse_avg = val_mse_sum / max(1, n_folds)
+        print(
+            f"[EPOCH {ep + 1}] "
+            f"train_eipm={lval:.6g} "
+            f"val_eipm={val_eipm_avg:.6g} "
+            f"val_mse={val_mse_avg:.6g}"
+        )
 
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -460,7 +523,7 @@ class ReplicationData:
     seed: int
     rep_idx: int
     Xtilde: np.ndarray  # (n_train, d_X)
-    tildeT: np.ndarray  # (n_train,)
+    Ttilde: np.ndarray  # (n_train,)
     Y: np.ndarray       # (n_train,)
     meta: Dict          # extra scalars/arrays for bookkeeping
 
@@ -487,9 +550,9 @@ def load_replications_from_npz(npz_path: str) -> List[ReplicationData]:
 
     Xtilde_all = data["Xtilde_train"]       # (n_rpt, n_train, d_X)
     if "Ttilde_train" in data.files:
-        tildeT_all = data["Ttilde_train"]  # (n_rpt, n_train)
+        Ttilde_all = data["Ttilde_train"]  # (n_rpt, n_train)
     else:
-        tildeT_all = data["tildeT_train"]  # (n_rpt, n_train)
+        Ttilde_all = data["tildeT_train"]  # (n_rpt, n_train)
     Y_all = data["Y_train"]                 # (n_rpt, n_train)
 
     reps: List[ReplicationData] = []
@@ -516,7 +579,7 @@ def load_replications_from_npz(npz_path: str) -> List[ReplicationData]:
                 seed=seed,
                 rep_idx=r,
                 Xtilde=np.asarray(Xtilde_all[r]),
-                tildeT=np.asarray(tildeT_all[r]),
+                Ttilde=np.asarray(Ttilde_all[r]),
                 Y=np.asarray(Y_all[r]),
                 meta=meta,
             )
@@ -689,10 +752,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n_trials", type=int, default=25)
     p.add_argument("--k_folds", type=int, default=5)
     p.add_argument("--tune_rep_idx", type=int, default=0)
-    p.add_argument("--tune_steps", type=int, default=50)
-    p.add_argument("--only_first_file", action="store_true")
-    p.add_argument("--only_first_rep", action="store_true")
-    p.add_argument("--profile", action="store_true")
+    p.add_argument("--max_steps", type=int, default=500)
+    p.add_argument("--patience", type=int, default=3)
+    p.add_argument("--min_delta", type=float, default=1e-6)
 
     # Reproducibility
     p.add_argument("--seed", type=int, default=42)
@@ -739,12 +801,7 @@ def main() -> None:
     train_times: List[float] = []
 
     for file_idx_1based, npz_path in enumerate(files, start=1):
-        if args.only_first_file and file_idx_1based > 1:
-            break
-        t_file0 = time.perf_counter()
         reps = load_replications_from_npz(npz_path)
-        if args.profile:
-            print(f"[PROFILE] load_replications: {Path(npz_path).name} {time.perf_counter() - t_file0:.3f}s")
 
         if len(reps) == 0:
             continue
@@ -763,8 +820,6 @@ def main() -> None:
             continue
 
         for rep in reps_to_run:
-            if args.only_first_rep and rep.rep_idx > 0:
-                break
             ckpt_path = make_ckpt_path(out_dir, npz_path, rep.rep_idx, depth, width)
 
             hp_path = make_hp_path(out_dir, npz_path, rep.rep_idx, depth, width)
@@ -780,9 +835,8 @@ def main() -> None:
             input_dim = int(rep.d_X) + 1
 
             if best_params is None or best_value is None:
-                t_tune0 = time.perf_counter()
                 X_tune = torch.tensor(rep.Xtilde, dtype=torch.float32, device=device)
-                T_tune = torch.tensor(rep.tildeT, dtype=torch.float32, device=device)
+                T_tune = torch.tensor(rep.Ttilde, dtype=torch.float32, device=device)
                 Y_tune = torch.tensor(rep.Y, dtype=torch.float32, device=device)
 
                 X_scaled_tune = X_tune / math.sqrt(float(rep.d_X))
@@ -798,15 +852,17 @@ def main() -> None:
                         device=device,
                         depth=depth,
                         width=width,
-                        tune_steps=int(args.tune_steps),
+                        max_steps=int(args.max_steps),
+                        patience=int(args.patience),
+                        min_delta=float(args.min_delta),
                         n_splits=int(args.k_folds),
                         seed=int(args.seed),
-                        profile=bool(args.profile),
                     )
 
+                t_tune0 = time.time()
                 study = optuna.create_study(direction="minimize")
                 study.optimize(_obj, n_trials=int(args.n_trials), show_progress_bar=False)
-                t_tune1 = time.perf_counter()
+                t_tune1 = time.time()
 
                 best_params = study.best_params
                 best_value = float(study.best_value)
@@ -823,17 +879,15 @@ def main() -> None:
 
                 tune_times.append(t_tune1 - t_tune0)
                 done_tune += 1
-                if args.profile:
-                    print(f"[PROFILE] tune_rep: rep={rep.rep_idx} {t_tune1 - t_tune0:.3f}s")
 
             X = torch.tensor(rep.Xtilde, dtype=torch.float32, device=device)
-            T = torch.tensor(rep.tildeT, dtype=torch.float32, device=device)
+            T = torch.tensor(rep.Ttilde, dtype=torch.float32, device=device)
             Y = torch.tensor(rep.Y, dtype=torch.float32, device=device)
 
             X_scaled = X / math.sqrt(float(rep.d_X))
             T_scaled = T.view(-1)
 
-            t_train0 = time.perf_counter()
+            t_train0 = time.time()
             model, train_stats = train_final_model_full(
                 X_scaled=X_scaled,
                 T_scaled=T_scaled,
@@ -843,12 +897,11 @@ def main() -> None:
                 best_params=best_params,
                 depth=depth,
                 width=width,
+                k_folds=int(args.k_folds),
                 seed=int(args.seed),
                 epochs=int(args.epochs),
             )
-            t_train1 = time.perf_counter()
-            if args.profile:
-                print(f"[PROFILE] train_rep: rep={rep.rep_idx} {t_train1 - t_train0:.3f}s")
+            t_train1 = time.time()
 
             atomic_torch_save(
                 ckpt_path,
