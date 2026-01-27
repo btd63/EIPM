@@ -1,11 +1,11 @@
 # train_eipm.py
 # Train EIPM (Expected Integral Probability Metrics) weighting model on TRAIN data only.
 #
-# This script is designed to work with datasets produced by DGP.py in this project.
-# DGP.py saves (stacked over replications):
-#   - train: Xtilde_train, Ttilde_train, Y_train (and also Z_train, X_train, logT_train, T_train)
+# This script is designed to work with datasets produced by my_dgp.py in this project.
+# my_dgp.py saves (stacked over replications):
+#   - train (observed only): X_train, T_train, Y_train
 #   - eval:  T_eval, mu_eval (ADRF)   <-- MUST NOT be used here (per user's instruction).
-# See DGP.py "Saved outputs" description.  (We intentionally ignore eval keys.)
+# See my_dgp.py "Saved outputs" description.  (We intentionally ignore eval keys.)
 
 from __future__ import annotations
 
@@ -80,6 +80,26 @@ def atomic_torch_save(path: Path, obj: Dict) -> None:
     tmp = Path(str(path) + ".tmp")
     torch.save(obj, tmp)
     os.replace(tmp, path)
+
+
+def standardize_train(X: Tensor, T: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """
+    Standardize observed train data using sample mean/variance.
+    Returns standardized X, standardized T, X mean/std, and T mean/std (for later use).
+    """
+    T_flat = T.view(-1)
+
+    x_mean = X.mean(dim=0, keepdim=True)
+    x_var = X.var(dim=0, unbiased=False, keepdim=True)
+    x_std = torch.sqrt(x_var).clamp_min(1e-8)
+    X_std = (X - x_mean) / x_std
+
+    t_mean = T_flat.mean()
+    t_var = T_flat.var(unbiased=False)
+    t_std = torch.sqrt(t_var).clamp_min(1e-8)
+    T_std = (T_flat - t_mean) / t_std
+
+    return X_std, T_std, x_mean, x_std, t_mean, t_std
 
 
 def load_json_(path: Path) -> Dict:
@@ -300,7 +320,7 @@ def objective_cv_mse(
         splitter = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
         split_iter = splitter.split(np.arange(X_scaled.shape[0]))
 
-    eval_every = 1
+    eval_every = 10
     fold_mse: List[float] = []
 
     for fold_i, (tr_idx, va_idx) in enumerate(split_iter, start=1):
@@ -338,20 +358,6 @@ def objective_cv_mse(
             opt.step()
             if (it + 1) % eval_every == 0:
                 model.eval()
-                if fold_i == 1:
-                    with torch.no_grad():
-                        s_tmp = model(X_tr, T_tr).view(-1)
-                        s_range = float(s_tmp.max().item() - s_tmp.min().item())
-                        s_std = float(s_tmp.std().item())
-                        s_max = torch.max(s_tmp)
-                        w_tmp = torch.exp(s_tmp - s_max)
-                        w_range = float(w_tmp.max().item() - w_tmp.min().item())
-                        w_std = float(w_tmp.std().item())
-                    print(
-                        f"[SVAL] step={it + 1} "
-                        f"s_range={s_range:.3g} s_std={s_std:.3g} "
-                        f"w_range={w_range:.3g} w_std={w_std:.3g}"
-                    )
                 hq = h0_t(
                     T_train=T_tr,
                     t=T_va,
@@ -393,6 +399,103 @@ def objective_cv_mse(
 
     result = float(np.mean(fold_mse))
     return result
+
+
+def train_folds_for_params(
+    X_scaled: Tensor,
+    T_scaled: Tensor,
+    Y: Tensor,
+    input_dim: int,
+    device: torch.device,
+    depth: int,
+    width: int,
+    params: Dict,
+    *,
+    max_steps: int,
+    patience: int,
+    min_delta: float,
+    n_splits: int,
+    seed: int,
+) -> Tuple[List[Dict[str, Tensor]], List[float]]:
+    a_sigma = math.exp(float(params["log_a_sigma"]))
+    a_h = math.exp(float(params["log_a_h"]))
+    k_nn = int(params["k_nn"])
+    lr = float(params["lr"])
+    weight_decay = float(params["weight_decay"])
+
+    with torch.no_grad():
+        y_strat = (T_scaled.detach().cpu().numpy() == 0.0).astype(int)
+        use_strat = (np.unique(y_strat).size >= 2)
+
+    if use_strat:
+        splitter = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+        split_iter = splitter.split(np.zeros_like(y_strat), y_strat)
+    else:
+        splitter = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
+        split_iter = splitter.split(np.arange(X_scaled.shape[0]))
+
+    eval_every = 10
+    fold_states: List[Dict[str, Tensor]] = []
+    fold_mse: List[float] = []
+
+    for tr_idx, va_idx in split_iter:
+        tr = torch.as_tensor(tr_idx, device=device, dtype=torch.long)
+        va = torch.as_tensor(va_idx, device=device, dtype=torch.long)
+
+        X_tr, T_tr, Y_tr = X_scaled[tr], T_scaled[tr], Y[tr]
+        X_va, T_va, Y_va = X_scaled[va], T_scaled[va], Y[va]
+
+        model = EIPM(input_dim=input_dim, hidden=width, n_layers=depth).to(device)
+        opt = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+        best_mse = float("inf")
+        no_improve = 0
+        for it in range(int(max_steps)):
+            opt.zero_grad(set_to_none=True)
+            loss = compute_eipm_loss(model, X_tr, T_tr, a_sigma, a_h, k_nn)
+            loss.backward()
+            opt.step()
+
+            if (it + 1) % eval_every == 0:
+                model.eval()
+                hq = h0_t(
+                    T_train=T_tr,
+                    t=T_va,
+                    a_h=float(a_h),
+                    k=int(k_nn),
+                )
+                preds = []
+                for i in range(T_va.numel()):
+                    preds.append(mu_hat_at_t(model, X_tr, T_tr, Y_tr, T_va[i], float(hq[i].item())))
+                pred = torch.stack(preds).view(-1)
+                mse = torch.mean((pred - Y_va.view(-1)) ** 2).item()
+                if mse < best_mse - float(min_delta):
+                    best_mse = float(mse)
+                    no_improve = 0
+                else:
+                    no_improve += 1
+                model.train()
+                if no_improve >= int(patience):
+                    break
+
+        if best_mse == float("inf"):
+            model.eval()
+            hq = h0_t(
+                T_train=T_tr,
+                t=T_va,
+                a_h=float(a_h),
+                k=int(k_nn),
+            )
+            preds = []
+            for i in range(T_va.numel()):
+                preds.append(mu_hat_at_t(model, X_tr, T_tr, Y_tr, T_va[i], float(hq[i].item())))
+            pred = torch.stack(preds).view(-1)
+            best_mse = float(torch.mean((pred - Y_va.view(-1)) ** 2).item())
+
+        fold_states.append({k: v.detach().cpu().clone() for k, v in model.state_dict().items()})
+        fold_mse.append(float(best_mse))
+
+    return fold_states, fold_mse
 
 
 # ============================================================
@@ -439,7 +542,7 @@ def train_final_model_full(
     for ep in range(int(epochs)):
         model.train()
         opt.zero_grad(set_to_none=True)
-        loss = compute_eipm_loss(model, X_tr, T_tr, a_sigma, a_h, k_nn)
+        loss = compute_eipm_loss(model, X_scaled, T_scaled, a_sigma, a_h, k_nn)
         loss.backward()
         opt.step()
 
@@ -522,8 +625,8 @@ class ReplicationData:
     n_train: int
     seed: int
     rep_idx: int
-    Xtilde: np.ndarray  # (n_train, d_X)
-    Ttilde: np.ndarray  # (n_train,)
+    X: np.ndarray  # (n_train, d_X)
+    T: np.ndarray  # (n_train,)
     Y: np.ndarray       # (n_train,)
     meta: Dict          # extra scalars/arrays for bookkeeping
 
@@ -534,8 +637,8 @@ def load_replications_from_npz(npz_path: str) -> List[ReplicationData]:
 
     DGP stacks arrays across replications along axis=0.
     For example:
-      Xtilde_train: (n_rpt, n_train, d_X)
-      Ttilde_train: (n_rpt, n_train)
+      X_train: (n_rpt, n_train, d_X)
+      T_train: (n_rpt, n_train)
       Y_train:      (n_rpt, n_train)
 
     We IGNORE eval keys (T_eval, mu_eval, ...).
@@ -548,11 +651,11 @@ def load_replications_from_npz(npz_path: str) -> List[ReplicationData]:
     n_rpt = int(np.array(data["n_rpt"]).item())
     seed = int(np.array(data["seed"]).item())
 
-    Xtilde_all = data["Xtilde_train"]       # (n_rpt, n_train, d_X)
-    if "Ttilde_train" in data.files:
-        Ttilde_all = data["Ttilde_train"]  # (n_rpt, n_train)
-    else:
-        Ttilde_all = data["tildeT_train"]  # (n_rpt, n_train)
+    if "X_train" not in data.files or "T_train" not in data.files or "Y_train" not in data.files:
+        raise KeyError("Expected observed keys X_train, T_train, Y_train in dataset")
+
+    X_all = data["X_train"]               # (n_rpt, n_train, d_X)
+    T_all = data["T_train"]               # (n_rpt, n_train)
     Y_all = data["Y_train"]                 # (n_rpt, n_train)
 
     reps: List[ReplicationData] = []
@@ -578,8 +681,8 @@ def load_replications_from_npz(npz_path: str) -> List[ReplicationData]:
                 n_train=n_train,
                 seed=seed,
                 rep_idx=r,
-                Xtilde=np.asarray(Xtilde_all[r]),
-                Ttilde=np.asarray(Ttilde_all[r]),
+                X=np.asarray(X_all[r]),
+                T=np.asarray(T_all[r]),
                 Y=np.asarray(Y_all[r]),
                 meta=meta,
             )
@@ -835,12 +938,13 @@ def main() -> None:
             input_dim = int(rep.d_X) + 1
 
             if best_params is None or best_value is None:
-                X_tune = torch.tensor(rep.Xtilde, dtype=torch.float32, device=device)
-                T_tune = torch.tensor(rep.Ttilde, dtype=torch.float32, device=device)
+                X_tune = torch.tensor(rep.X, dtype=torch.float32, device=device)
+                T_tune = torch.tensor(rep.T, dtype=torch.float32, device=device)
                 Y_tune = torch.tensor(rep.Y, dtype=torch.float32, device=device)
 
-                X_scaled_tune = X_tune / math.sqrt(float(rep.d_X))
-                T_scaled_tune = T_tune.view(-1)
+                X_std_tune, T_std_tune, _, _, _, _ = standardize_train(X_tune, T_tune)
+                X_scaled_tune = X_std_tune / math.sqrt(float(rep.d_X))
+                T_scaled_tune = T_std_tune.view(-1)
 
                 def _obj(trial):
                     return objective_cv_mse(
@@ -866,6 +970,7 @@ def main() -> None:
 
                 best_params = study.best_params
                 best_value = float(study.best_value)
+                best_trial_num = int(study.best_trial.number)
 
                 atomic_write_json(
                     hp_path,
@@ -874,42 +979,133 @@ def main() -> None:
                         "rep_idx": int(rep.rep_idx),
                         "best_cv_mse": best_value,
                         "best_params": best_params,
+                        "best_trial": best_trial_num,
+                    },
+                )
+                hp_obj = {
+                    "best_cv_mse": best_value,
+                    "best_params": best_params,
+                    "best_trial": best_trial_num,
+                }
+
+                X_tune = torch.tensor(rep.X, dtype=torch.float32, device=device)
+                T_tune = torch.tensor(rep.T, dtype=torch.float32, device=device)
+                Y_tune = torch.tensor(rep.Y, dtype=torch.float32, device=device)
+                X_std_tune, T_std_tune, _, _, _, _ = standardize_train(X_tune, T_tune)
+                X_scaled_tune = X_std_tune / math.sqrt(float(rep.d_X))
+                T_scaled_tune = T_std_tune.view(-1)
+
+                fold_states, fold_mse = train_folds_for_params(
+                    X_scaled=X_scaled_tune,
+                    T_scaled=T_scaled_tune,
+                    Y=Y_tune,
+                    input_dim=input_dim,
+                    device=device,
+                    depth=depth,
+                    width=width,
+                    params=best_params,
+                    max_steps=int(args.max_steps),
+                    patience=int(args.patience),
+                    min_delta=float(args.min_delta),
+                    n_splits=int(args.k_folds),
+                    seed=int(args.seed),
+                )
+
+                fold_dir = out_dir / "tune_folds"
+                fold_dir.mkdir(parents=True, exist_ok=True)
+                fold_tag = f"{Path(npz_path).stem}_rep{rep.rep_idx:03d}_d{depth}_w{width}"
+                fold_path = fold_dir / f"{fold_tag}_best_trial{best_trial_num:03d}.pth"
+                atomic_torch_save(
+                    fold_path,
+                    {
+                        "trial": best_trial_num,
+                        "fold_states": fold_states,
+                        "fold_mse": fold_mse,
                     },
                 )
 
                 tune_times.append(t_tune1 - t_tune0)
                 done_tune += 1
 
-            X = torch.tensor(rep.Xtilde, dtype=torch.float32, device=device)
-            T = torch.tensor(rep.Ttilde, dtype=torch.float32, device=device)
-            Y = torch.tensor(rep.Y, dtype=torch.float32, device=device)
+            fold_tag = f"{Path(npz_path).stem}_rep{rep.rep_idx:03d}_d{depth}_w{width}"
+            fold_dir = out_dir / "tune_folds"
+            best_trial_num = None
+            if hp_obj is not None and isinstance(hp_obj, dict):
+                best_trial_num = hp_obj.get("best_trial")
+            if isinstance(best_trial_num, int):
+                fold_path = fold_dir / f"{fold_tag}_best_trial{best_trial_num:03d}.pth"
+            else:
+                fold_path = None
 
-            X_scaled = X / math.sqrt(float(rep.d_X))
-            T_scaled = T.view(-1)
+            if fold_path is not None and fold_path.exists():
+                fold_payload = torch.load(fold_path, map_location="cpu")
+                fold_states = fold_payload.get("fold_states")
+                if isinstance(fold_states, list) and len(fold_states) > 0:
+                    avg_state = {}
+                    keys = fold_states[0].keys()
+                    for k in keys:
+                        stacked = torch.stack([fs[k] for fs in fold_states], dim=0)
+                        avg_state[k] = torch.mean(stacked, dim=0)
+                    model_state = avg_state
+                else:
+                    model_state = None
+                t_train0 = time.time()
+                t_train1 = t_train0
+                train_stats = {
+                    "best_eipm_loss": float("nan"),
+                    "sigma": float("nan"),
+                    "h_median": float("nan"),
+                    "k_nn": float(best_params.get("k_nn", float("nan"))),
+                    "lr": float(best_params.get("lr", float("nan"))),
+                    "weight_decay": float(best_params.get("weight_decay", float("nan"))),
+                    "epochs": float(args.epochs),
+                }
+            else:
+                X = torch.tensor(rep.X, dtype=torch.float32, device=device)
+                T = torch.tensor(rep.T, dtype=torch.float32, device=device)
+                Y = torch.tensor(rep.Y, dtype=torch.float32, device=device)
 
-            t_train0 = time.time()
-            model, train_stats = train_final_model_full(
-                X_scaled=X_scaled,
-                T_scaled=T_scaled,
-                Y=Y,
-                input_dim=input_dim,
-                device=device,
-                best_params=best_params,
-                depth=depth,
-                width=width,
-                k_folds=int(args.k_folds),
-                seed=int(args.seed),
-                epochs=int(args.epochs),
-            )
-            t_train1 = time.time()
+                X_std, T_std, _, _, _, _ = standardize_train(X, T)
+                X_scaled = X_std / math.sqrt(float(rep.d_X))
+                T_scaled = T_std.view(-1)
+
+                t_train0 = time.time()
+                model, train_stats = train_final_model_full(
+                    X_scaled=X_scaled,
+                    T_scaled=T_scaled,
+                    Y=Y,
+                    input_dim=input_dim,
+                    device=device,
+                    best_params=best_params,
+                    depth=depth,
+                    width=width,
+                    k_folds=int(args.k_folds),
+                    seed=int(args.seed),
+                    epochs=int(args.epochs),
+                )
+                t_train1 = time.time()
+                model_state = model.state_dict()
+
+            X_raw = torch.tensor(rep.X, dtype=torch.float32, device=device)
+            T_raw = torch.tensor(rep.T, dtype=torch.float32, device=device)
+            _, _, x_mean_t, x_std_t, t_mean_t, t_std_t = standardize_train(X_raw, T_raw)
 
             atomic_torch_save(
                 ckpt_path,
                 {
-                    "model_state": model.state_dict(),
+                    "model_state": model_state,
+                    "ensemble_fold_states": fold_payload.get("fold_states") if fold_path is not None and fold_path.exists() else None,
+                    "ensemble_fold_mse": fold_payload.get("fold_mse") if fold_path is not None and fold_path.exists() else None,
+                    "ensemble_best_trial": best_trial_num,
                     "best_params": best_params,
                     "best_cv_mse": float(best_value),
                     "train_stats": train_stats,
+                    "standardize": {
+                        "x_mean": x_mean_t.view(-1).detach().cpu().numpy(),
+                        "x_std": x_std_t.view(-1).detach().cpu().numpy(),
+                        "t_mean": float(t_mean_t),
+                        "t_std": float(t_std_t),
+                    },
                     "rep_meta": rep.meta,
                     "script_args": vars(args),
                 },

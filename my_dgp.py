@@ -379,19 +379,20 @@ def generate_one_replication(
             rng=rng, t=T_eval, d_X=d_X, beta_Y_nonlinear=beta_Y_nonlinear, ET=ET, VT=VT, m=200
         )
     out: Dict[str, Any] = {
+        # observed data
+        "X_train": X_train,
+        "T_train": T_train,
+        "Y_train": Y_train,
         # moments for X standardization
         "EX": EX,
         "VX": VX,
         # moments for T standardization
         "ET": np.array([ET], dtype=float),
         "VT": np.array([VT], dtype=float),
-        # train data
+        # latent variables
         "Z_train": Z_train,
-        "X_train": X_train,
         "Xtilde_train": Xtilde_train,
-        "T_train": T_train,
         "Ttilde_train": Ttilde_train,
-        "Y_train": Y_train,
         "beta_pi0": np.array([beta_pi0], dtype=float),
         "beta_pi": beta_pi,
         "beta_T0": np.array([beta_T0], dtype=float),
