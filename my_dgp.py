@@ -33,11 +33,31 @@ def _E_fZ(f) -> float: # E[f(Z)]의 근삿값
     vals = f(z)
     return float(np.sum(ws * vals) / np.sqrt(np.pi))
 
-def save(payload: Dict[str, Any], out_name: str) -> Tuple[str]: # payload를 out_name의 이름으로 저장
+def save(payload: Dict[str, Any], out_name: str, save_csv: bool = True) -> Tuple[str]: # payload를 out_name의 이름으로 저장
     out_dir = "./datasets"
     os.makedirs(out_dir, exist_ok=True)
     npz_name = os.path.join(out_dir, f"{out_name}.npz")
     np.savez_compressed(npz_name, **payload)
+
+    if save_csv:
+        csv_dir = os.path.join(out_dir, "csv", out_name)
+        os.makedirs(csv_dir, exist_ok=True)
+        X_all = payload.get("X_train")
+        T_all = payload.get("T_train")
+        Y_all = payload.get("Y_train")
+        if isinstance(X_all, np.ndarray) and isinstance(T_all, np.ndarray) and isinstance(Y_all, np.ndarray):
+            n_rpt = X_all.shape[0]
+            d_x = X_all.shape[2]
+            header = ",".join([f"X{i+1}" for i in range(d_x)] + ["T", "Y"])
+            for r in range(n_rpt):
+                rep_path = os.path.join(csv_dir, f"rep{r:03d}.csv")
+                if os.path.exists(rep_path):
+                    continue
+                Xr = X_all[r]
+                Tr = T_all[r].reshape(-1, 1)
+                Yr = Y_all[r].reshape(-1, 1)
+                rows = np.hstack([Xr, Tr, Yr])
+                np.savetxt(rep_path, rows, delimiter=",", header=header, comments="")
     return npz_name
 
 def generate_Z(rng: np.random.Generator, n: int, d_X: int) -> np.ndarray: # Z ~ N(0, I_d_X) 생성.
@@ -491,6 +511,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n_rpt", type=int, default=100)
     p.add_argument("--pi_0", type=float, default=0.0)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--save_csv", type=int, default=1)
 
     # sparsity controls (optional)
     p.add_argument("--treatment_k", type=int, default=None)
@@ -525,7 +546,7 @@ def main() -> None:
     )
 
     payload = generate_dataset(cfg)
-    npz_name = save(payload, out_name)
+    npz_name = save(payload, out_name, save_csv=bool(args.save_csv))
     print(f"Saved: {npz_name}")
 
 if __name__ == "__main__":

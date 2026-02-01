@@ -69,6 +69,7 @@ def main():
 
     npz_path = files[0]
     print(f"[INFO] Using dataset: {Path(npz_path).name}")
+    print(f"[INFO] Dataset path: {Path(npz_path).resolve()}")
 
     reps = load_replications_from_npz(npz_path)
     reps_to_run = reps[:100]
@@ -152,7 +153,6 @@ def main():
             "best_eipm_loss": float("nan"),
             "sigma": float("nan"),
             "h_median": float("nan"),
-            "k_nn": float(best_params.get("k_nn", float("nan"))),
             "lr": float(best_params.get("lr", float("nan"))),
             "weight_decay": float(best_params.get("weight_decay", float("nan"))),
             "epochs": float(args.epochs),

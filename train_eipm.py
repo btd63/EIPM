@@ -41,6 +41,56 @@ except Exception:
 # 0. Utility
 # ============================================================
 
+def _locfit_modules():
+    try:
+        from rpy2 import robjects as ro
+        from rpy2.robjects import numpy2ri
+        from rpy2.robjects import packages as rpackages
+    except Exception as exc:  # pragma: no cover - environment dependent
+        raise RuntimeError("rpy2 is required to use locfit in CV.") from exc
+
+    if not rpackages.isinstalled("locfit"):
+        raise RuntimeError("R package 'locfit' is required.")
+
+    numpy2ri.activate()
+    locfit = rpackages.importr("locfit")
+    base = rpackages.importr("base")
+    return ro, locfit, base
+
+
+def locfit_mu_at_t(
+    X_tr: Tensor,
+    T_tr: Tensor,
+    Y_tr: Tensor,
+    model: nn.Module,
+    t_val: Tensor,
+    a_h: float,
+    alpha: float,
+) -> Tensor:
+    # w_i = exp(s(X_i, t)) with t fixed, then weighted locfit at t
+    t_fixed = t_val.view(1).repeat(X_tr.shape[0]).view(-1, 1)
+    with torch.no_grad():
+        w = torch.exp(model(X_tr, t_fixed)).view(-1).cpu().numpy()
+
+    T_np = T_tr.detach().cpu().numpy()
+    Y_np = Y_tr.detach().cpu().numpy()
+
+    # h(t) = a_h * dist(t)^alpha, dist(t)=0.1-quantile of |T_i - t|
+    with torch.no_grad():
+        dist = torch.abs(T_tr.view(-1) - t_val.view(()))
+        dist_q = torch.quantile(dist, 0.1)
+        h_t = float(a_h) * float(dist_q.item() ** float(alpha))
+        if h_t <= 1e-8:
+            h_t = 1e-8
+
+    ro, locfit, base = _locfit_modules()
+    dfx = ro.DataFrame({"Y": ro.FloatVector(Y_np), "TRT": ro.FloatVector(T_np)})
+    w_r = ro.FloatVector(w)
+    fit = locfit.locfit(ro.Formula("Y ~ lp(TRT, h=%f)" % h_t), weights=w_r, data=dfx)
+    pred = base.predict(fit, newdata=ro.FloatVector([float(t_val.item())]), where="fitp")
+    return torch.tensor(float(pred[0]), device=X_tr.device)
+
+
 def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -167,25 +217,6 @@ def get_med(x: Tensor, max_n: int = 500) -> float:
     return float(torch.median(d).item())
 
 
-@torch.no_grad()
-def h0_t( # h_0(t)
-    T_train: torch.Tensor,          # (n_train,)
-    t: torch.Tensor,                # (m,)
-    *,
-    a_h: float,
-    k: int = 20,
-) -> torch.Tensor: # (m,)
-    T_tr = T_train.view(-1, 1)      # (n,1)
-    T_q  = t.view(1, -1)      # (1,m)
-    n = T_tr.shape[0]
-    dist = torch.abs(T_tr - T_q)    # (n,m)
-
-    # kNN radius (order statistic)
-    dist_sorted, _ = torch.sort(dist, dim=0)  # (n,m)
-    k_eff = min(k, n - 1)        # 1..n-1
-    h_knn = a_h * dist_sorted[k_eff, :]             # (m,)
-    return h_knn.clamp_min(1e-8).view(-1, 1)
-
 # ============================================================
 # 3. EIPM loss
 # ============================================================
@@ -200,15 +231,27 @@ def h0_t( # h_0(t)
 #     return torch.exp(s - s_max)
 
 
-def compute_eipm_loss(model: nn.Module, X: Tensor, T: Tensor, a_sigma: float, a_h: float, k_nn: int) -> Tensor:
+def h0_t(
+    T_train: Tensor,
+    t: Tensor,
+    *,
+    a_h: float,
+    alpha: float,
+) -> Tensor:
+    T_tr = T_train.view(-1, 1)
+    t_q = t.view(1, -1)
+    dist = torch.abs(T_tr - t_q)  # (n,m)
+    dist_q = torch.quantile(dist, 0.1, dim=0)
+    h = float(a_h) * (dist_q ** float(alpha))
+    return h.clamp_min(1e-8).view(-1, 1)
+
+
+def compute_eipm_loss(model: nn.Module, X: Tensor, T: Tensor, a_sigma: float, a_h: float, alpha: float) -> Tensor:
     r"""
     EIPM loss (empirical MMD^2 averaged over target indices i):
     For each target i (with t_i = T_i), define weights over j:
       w_{ij} =  K_T(t_i, T_j; h_loss) * exp(s_theta(X_j, T_j)) / \sum_{l} K_T(t_i, T_l; h_loss) * exp(s_theta(X_l, T_l)).
     """
-    h_T_vec = h0_t(T_train=T, t=T, a_h=float(a_h), k=int(k_nn))
-    h_T_vec = h_T_vec.view(-1, 1)          # (n,1)
-
     s_val = model(X, T)                    # (n,)
     s_max = torch.max(s_val)
     W_s = torch.exp(s_val-s_max)            # (n,)
@@ -216,7 +259,9 @@ def compute_eipm_loss(model: nn.Module, X: Tensor, T: Tensor, a_sigma: float, a_
     T_flat = T.view(-1, 1)
     dist_sq_T = (T_flat - T_flat.t()) ** 2  # (n,n)
 
-    H = (h_T_vec @ h_T_vec.t()).clamp_min(1e-8)  # (n,n), H_ij = h_i * h_j
+    h_T_vec = h0_t(T_train=T, t=T, a_h=float(a_h), alpha=float(alpha))
+    h_T_vec = h_T_vec.view(-1, 1)
+    H = (h_T_vec @ h_T_vec.t()).clamp_min(1e-8)  # (n,n)
     K_T = torch.exp(-0.5 * dist_sq_T / H)        # (n,n)
 
     d_med = get_med(X)
@@ -232,43 +277,6 @@ def compute_eipm_loss(model: nn.Module, X: Tensor, T: Tensor, a_sigma: float, a_
 
     loss = torch.mean(term1 - term3 + term2)
     return loss
-
-
-@torch.no_grad()
-def mu_hat_at_t(
-    model: nn.Module,
-    X_train: Tensor,
-    T_train: Tensor,
-    Y_train: Tensor,
-    t: Tensor,
-    h_query: float,
-) -> Tensor:
-    r"""
-    Local kernel regressor with learned weights:
-
-      \hat{\mu}(t) = \sum_{j=1}^n W_j(t) Y_j,
-
-    where
-      W_j(t) ∝ K_{h(t)}(T_j - t) * exp(s_theta(X_j, T_j)),
-
-    with numerically-stable exp(s) = exp(s - max s).
-    """
-    s_tr = model(X_train, T_train).view(-1)            # (n,)
-    s_max = torch.max(s_tr)
-    W_s_tr = torch.exp(s_tr-s_max)            # (n,)
-
-    hq = float(h_query)
-    if hq < 1e-8:
-        hq = 1e-8
-    diff_sq = (T_train.view(-1) - t.view(())) ** 2
-    K = torch.exp(-0.5 * diff_sq / (hq ** 2))
-
-    w_unnorm = K * W_s_tr
-    denom = torch.sum(w_unnorm) + 1e-8
-    W = w_unnorm / denom
-
-    mu = torch.sum(W * Y_train.view(-1))
-    return mu
 
 
 # ============================================================
@@ -294,14 +302,13 @@ def objective_cv_mse(
     Tune hyperparameters by K-fold CV on the TRAIN set only.
 
     Key point for bandwidth:
-      - We define query-wise bandwidth function h(t) = a_h * h0(t).
-      - CV optimizes a_h (not "a standalone h").
-      - h(t) is used ONLY in K_{h(t)}(T_j - t) inside mu_hat_at_t.
+      - We use h(t) = a_h * dist(t)^alpha with dist(t)=0.1-quantile of |T_i - t|.
+      - The same h(t) is used both in K_T and in locfit during CV.
       - We do not use any eval data (T_eval, mu_eval) from DGP.
     """
     log_a_sigma = trial.suggest_float("log_a_sigma", -2.0, 2.0)
     log_a_h = trial.suggest_float("log_a_h", -2.0, 2.0)
-    k_nn = trial.suggest_int("k_nn", 5, 50)
+    alpha = trial.suggest_float("alpha", 0.05, 0.95)
 
     a_sigma = math.exp(float(log_a_sigma))
     a_h = math.exp(float(log_a_h))
@@ -338,36 +345,21 @@ def objective_cv_mse(
         no_improve = 0
         for it in range(int(max_steps)):
             opt.zero_grad(set_to_none=True)
-            loss = compute_eipm_loss(model, X_tr, T_tr, a_sigma, a_h, k_nn)
+            loss = compute_eipm_loss(model, X_tr, T_tr, a_sigma, a_h, alpha)
             if not torch.isfinite(loss):
-                with torch.no_grad():
-                    h_dbg = h0_t(T_train=T_tr, t=T_tr, a_h=float(a_h), k=int(k_nn)).view(-1)
-                    h_min = float(h_dbg.min().item())
-                    h_med = float(torch.median(h_dbg).item())
-                    h_max = float(h_dbg.max().item())
-                    h_zeros = int((h_dbg == 0).sum().item())
                 raise RuntimeError(
                     "EIPM loss is not finite: "
                     f"trial={getattr(trial, 'number', 'NA')} it={it} "
-                    f"a_sigma={a_sigma:.3g} a_h={a_h:.3g} k_nn={k_nn} "
+                    f"a_sigma={a_sigma:.3g} a_h={a_h:.3g} alpha={alpha:.3g} "
                     f"lr={lr:.3g} wd={weight_decay:.3g} "
-                    f"h(min/med/max)=({h_min:.3g},{h_med:.3g},{h_max:.3g}) "
-                    f"h_zeros={h_zeros}"
                 )
             loss.backward()
             opt.step()
             if (it + 1) % eval_every == 0:
                 model.eval()
-                hq = h0_t(
-                    T_train=T_tr,
-                    t=T_va,
-                    a_h=float(a_h),
-                    k=int(k_nn),
-                )
-
                 preds = []
                 for i in range(T_va.numel()):
-                    mu_i = mu_hat_at_t(model, X_tr, T_tr, Y_tr, T_va[i], float(hq[i].item()))
+                    mu_i = locfit_mu_at_t(model=model, X_tr=X_tr, T_tr=T_tr, Y_tr=Y_tr, t_val=T_va[i], a_h=a_h, alpha=alpha)
                     preds.append(mu_i)
                 pred = torch.stack(preds).view(-1)
                 mse = torch.mean((pred - Y_va.view(-1)) ** 2).item()
@@ -382,15 +374,9 @@ def objective_cv_mse(
                     break
         if best_mse == float("inf"):
             model.eval()
-            hq = h0_t(
-                T_train=T_tr,
-                t=T_va,
-                a_h=float(a_h),
-                k=int(k_nn),
-            )
             preds = []
             for i in range(T_va.numel()):
-                mu_i = mu_hat_at_t(model, X_tr, T_tr, Y_tr, T_va[i], float(hq[i].item()))
+                mu_i = locfit_mu_at_t(model=model, X_tr=X_tr, T_tr=T_tr, Y_tr=Y_tr, t_val=T_va[i], a_h=a_h, alpha=alpha)
                 preds.append(mu_i)
             pred = torch.stack(preds).view(-1)
             best_mse = float(torch.mean((pred - Y_va.view(-1)) ** 2).item())
@@ -419,7 +405,7 @@ def train_folds_for_params(
 ) -> Tuple[List[Dict[str, Tensor]], List[float]]:
     a_sigma = math.exp(float(params["log_a_sigma"]))
     a_h = math.exp(float(params["log_a_h"]))
-    k_nn = int(params["k_nn"])
+    alpha = float(params["alpha"])
     lr = float(params["lr"])
     weight_decay = float(params["weight_decay"])
 
@@ -452,21 +438,15 @@ def train_folds_for_params(
         no_improve = 0
         for it in range(int(max_steps)):
             opt.zero_grad(set_to_none=True)
-            loss = compute_eipm_loss(model, X_tr, T_tr, a_sigma, a_h, k_nn)
+            loss = compute_eipm_loss(model, X_tr, T_tr, a_sigma, a_h, alpha)
             loss.backward()
             opt.step()
 
             if (it + 1) % eval_every == 0:
                 model.eval()
-                hq = h0_t(
-                    T_train=T_tr,
-                    t=T_va,
-                    a_h=float(a_h),
-                    k=int(k_nn),
-                )
                 preds = []
                 for i in range(T_va.numel()):
-                    preds.append(mu_hat_at_t(model, X_tr, T_tr, Y_tr, T_va[i], float(hq[i].item())))
+                    preds.append(locfit_mu_at_t(model=model, X_tr=X_tr, T_tr=T_tr, Y_tr=Y_tr, t_val=T_va[i], a_h=a_h, alpha=alpha))
                 pred = torch.stack(preds).view(-1)
                 mse = torch.mean((pred - Y_va.view(-1)) ** 2).item()
                 if mse < best_mse - float(min_delta):
@@ -480,15 +460,9 @@ def train_folds_for_params(
 
         if best_mse == float("inf"):
             model.eval()
-            hq = h0_t(
-                T_train=T_tr,
-                t=T_va,
-                a_h=float(a_h),
-                k=int(k_nn),
-            )
             preds = []
             for i in range(T_va.numel()):
-                preds.append(mu_hat_at_t(model, X_tr, T_tr, Y_tr, T_va[i], float(hq[i].item())))
+                preds.append(locfit_mu_at_t(model=model, X_tr=X_tr, T_tr=T_tr, Y_tr=Y_tr, t_val=T_va[i], a_h=a_h, alpha=alpha))
             pred = torch.stack(preds).view(-1)
             best_mse = float(torch.mean((pred - Y_va.view(-1)) ** 2).item())
 
@@ -518,13 +492,12 @@ def train_final_model_full(
     set_seed(seed)
 
     log_a_sigma = float(best_params["log_a_sigma"])
-    log_a_h = float(best_params["log_a_h"])
-    k_nn = int(best_params["k_nn"])
     lr = float(best_params["lr"])
     weight_decay = float(best_params["weight_decay"])
 
     a_sigma = math.exp(log_a_sigma)
-    a_h = math.exp(log_a_h)
+    a_h = math.exp(float(best_params["log_a_h"]))
+    alpha = float(best_params["alpha"])
 
     with torch.no_grad():
         d_med = get_med(X_scaled)
@@ -542,7 +515,7 @@ def train_final_model_full(
     for ep in range(int(epochs)):
         model.train()
         opt.zero_grad(set_to_none=True)
-        loss = compute_eipm_loss(model, X_scaled, T_scaled, a_sigma, a_h, k_nn)
+        loss = compute_eipm_loss(model, X_scaled, T_scaled, a_sigma, a_h, alpha)
         loss.backward()
         opt.step()
 
@@ -563,16 +536,10 @@ def train_final_model_full(
                 X_tr, T_tr, Y_tr = X_scaled[tr], T_scaled[tr], Y[tr]
                 X_va, T_va, Y_va = X_scaled[va], T_scaled[va], Y[va]
 
-                val_eipm = compute_eipm_loss(model, X_va, T_va, a_sigma, a_h, k_nn)
-                hq = h0_t(
-                    T_train=T_tr,
-                    t=T_va,
-                    a_h=float(a_h),
-                    k=int(k_nn),
-                )
+                val_eipm = compute_eipm_loss(model, X_va, T_va, a_sigma, a_h, alpha)
                 preds = []
                 for i in range(T_va.numel()):
-                    preds.append(mu_hat_at_t(model, X_tr, T_tr, Y_tr, T_va[i], float(hq[i].item())))
+                    preds.append(locfit_mu_at_t(model=model, X_tr=X_tr, T_tr=T_tr, Y_tr=Y_tr, t_val=T_va[i], a_h=a_h, alpha=alpha))
                 pred = torch.stack(preds).view(-1)
                 val_mse = torch.mean((pred - Y_va.view(-1)) ** 2)
 
@@ -592,21 +559,10 @@ def train_final_model_full(
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    # representative number to log for "h_median": median of h(t) over t in T_train (query-wise)
-    with torch.no_grad():
-        hq_rep = h0_t(
-            T_train=T_scaled,
-            t=T_scaled,
-            a_h=float(a_h),
-            k=int(k_nn),
-        )
-        h_median = float(torch.median(hq_rep).item())
-
     train_stats = {
         "best_eipm_loss": float(best_loss),
         "sigma": float(sigma),
-        "h_median": float(h_median),
-        "k_nn": float(k_nn),
+        "alpha": float(alpha),
         "lr": float(lr),
         "weight_decay": float(weight_decay),
         "epochs": float(epochs),
@@ -718,8 +674,7 @@ SUMMARY_FIELDS = [
     "best_cv_mse",
     "best_eipm_loss",
     "sigma",
-    "h_median",
-    "k_nn",
+    "alpha",
     "lr",
     "weight_decay",
     "epochs",
@@ -746,7 +701,7 @@ def hp_is_valid(hp_obj: Optional[Dict]) -> bool:
     bp = hp_obj.get("best_params")
     if not isinstance(bp, dict):
         return False
-    needed = ["log_a_sigma", "log_a_h", "k_nn", "lr", "weight_decay"]
+    needed = ["log_a_sigma", "log_a_h", "alpha", "lr", "weight_decay"]
     return all(k in bp for k in needed)
 
 
@@ -1054,8 +1009,7 @@ def main() -> None:
                 train_stats = {
                     "best_eipm_loss": float("nan"),
                     "sigma": float("nan"),
-                    "h_median": float("nan"),
-                    "k_nn": float(best_params.get("k_nn", float("nan"))),
+                    "alpha": float(best_params.get("alpha", float("nan"))),
                     "lr": float(best_params.get("lr", float("nan"))),
                     "weight_decay": float(best_params.get("weight_decay", float("nan"))),
                     "epochs": float(args.epochs),
@@ -1122,8 +1076,7 @@ def main() -> None:
                 "best_cv_mse": float(best_value),
                 "best_eipm_loss": float(train_stats["best_eipm_loss"]),
                 "sigma": float(train_stats["sigma"]),
-                "h_median": float(train_stats["h_median"]),
-                "k_nn": float(train_stats["k_nn"]),
+                "alpha": float(train_stats.get("alpha", float("nan"))),
                 "lr": float(train_stats["lr"]),
                 "weight_decay": float(train_stats["weight_decay"]),
                 "epochs": float(train_stats["epochs"]),

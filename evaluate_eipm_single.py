@@ -70,6 +70,8 @@ def main() -> None:
         raise FileNotFoundError(f"No npz files found in {args.data_dir} with pattern {args.pattern}")
 
     npz_path = files[0]
+    print(f"[INFO] Dataset path: {Path(npz_path).resolve()}")
+
     reps = load_replications_from_npz(npz_path)
     data = np.load(npz_path, allow_pickle=True)
     if "T_eval" not in data.files or "mu_eval" not in data.files:
@@ -146,21 +148,14 @@ def main() -> None:
 
         mse = float(np.mean((pred - mu_eval) ** 2))
         mae = float(np.mean(np.abs(pred - mu_eval)))
-
-        if int(rep.rep_idx) == 15:
-            sample_idx = np.linspace(0, len(T_eval) - 1, 5).astype(int)
-            print("[SAMPLE] t, mu_hat, mu_true")
-            for i in sample_idx:
-                print(f"{float(T_eval[i]):.6g}, {float(pred[i]):.6g}, {float(mu_eval[i]):.6g}")
-
         mse_list.append(mse)
         mae_list.append(mae)
 
         print(f"[EIPM] rep={rep.rep_idx:03d} MSE={mse:.6g} MAE={mae:.6g}")
 
-    mse_rms = float(np.sqrt(np.mean(np.square(np.array(mse_list))))) if mse_list else float("nan")
+    mse_mean = float(np.mean(np.array(mse_list))) if mse_list else float("nan")
     mae_mean = float(np.mean(np.array(mae_list))) if mae_list else float("nan")
-    print(f"[SUMMARY] MSE_mean={mse_rms:.6g} MAE_mean={mae_mean:.6g}")
+    print(f"[SUMMARY] MSE_mean={mse_mean:.6g} MAE_mean={mae_mean:.6g}")
 
 
 if __name__ == "__main__":
