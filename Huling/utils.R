@@ -1,5 +1,3 @@
-
-
 #' Calculation of weighted nonparametric regression estimate of the dose response function
 #'
 #' @description Calculates weighted nonparametric regression estimate of the causal average dose response function
@@ -44,4 +42,3 @@ weighted_kernel_est <- function(A, y, weights, Aseq)
   
   list(fit = locpoly_fit, estimated = estimated)
 }
-  

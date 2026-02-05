@@ -21,42 +21,42 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def estimate_adrf_locfit(
+def estimate_adrf_local_poly(
     T_obs: np.ndarray,
     Y_obs: np.ndarray,
-    weights: np.ndarray,
+    log_weights: np.ndarray,
     t_grid: np.ndarray,
     a_h: float,
     alpha: float,
 ) -> np.ndarray:
-    try:
-        from rpy2 import robjects as ro
-        from rpy2.robjects import numpy2ri
-        from rpy2.robjects import packages as rpackages
-    except Exception as exc:  # pragma: no cover - environment dependent
-        raise RuntimeError("rpy2 is required to call locfit from Python.") from exc
-
-    if not rpackages.isinstalled("locfit"):
-        raise RuntimeError("R package 'locfit' is required.")
-
-    numpy2ri.activate()
-
-    locfit = rpackages.importr("locfit")
-    base = rpackages.importr("base")
-
-    dfx = ro.DataFrame({"Y": ro.FloatVector(Y_obs), "TRT": ro.FloatVector(T_obs)})
-    w = ro.FloatVector(weights)
-
     preds = []
+    T_obs = np.asarray(T_obs, dtype=np.float64).reshape(-1)
+    Y_obs = np.asarray(Y_obs, dtype=np.float64).reshape(-1)
+    log_weights = np.asarray(log_weights, dtype=np.float64).reshape(-1)
+
     for t_val in t_grid:
-        dist = np.abs(T_obs - float(t_val))
+        t0 = float(t_val)
+        diff = T_obs - t0
+        dist = np.abs(diff)
         dist_q = np.quantile(dist, 0.1)
         h_t = float(a_h) * float(dist_q ** float(alpha))
         if h_t <= 1e-8:
             h_t = 1e-8
-        fit = locfit.locfit(ro.Formula("Y ~ lp(TRT, h=%f)" % h_t), weights=w, data=dfx)
-        pred = base.predict(fit, newdata=ro.FloatVector([float(t_val)]), where="fitp")
-        preds.append(float(pred[0]))
+        u = diff / h_t
+        logk = -0.5 * (u ** 2)
+        logw_eff = log_weights + logk
+        max_log = np.max(logw_eff)
+        w_eff = np.exp(logw_eff - max_log)
+        s = float(np.sum(w_eff))
+        if np.isfinite(s) and s > 0.0:
+            w_eff = w_eff / s
+        X_lp = np.stack([np.ones_like(diff), diff], axis=1)  # p=1
+        W = w_eff[:, None]
+        XW = X_lp * W
+        xtwx = X_lp.T @ XW
+        xtwy = XW.T @ Y_obs
+        beta = np.linalg.pinv(xtwx) @ xtwy
+        preds.append(float(beta[0]))
 
     return np.array(preds, dtype=np.float64)
 
@@ -92,6 +92,7 @@ def main() -> None:
         best_params = ckpt.get("best_params")
         if best_params is None:
             raise KeyError(f"best_params not found in checkpoint: {ckpt_path}")
+        fixed_params = ckpt.get("fixed_params", {})
         std = ckpt.get("standardize")
         if std is None:
             raise KeyError(f"standardize stats not found in checkpoint: {ckpt_path}")
@@ -118,8 +119,7 @@ def main() -> None:
         T_scaled = (T.view(-1) - t_mean) / t_std
 
         with torch.no_grad():
-            w = torch.exp(model(X_scaled, T_scaled)).detach().cpu().numpy().reshape(-1)
-        w = w / np.mean(w)
+            logw = model(X_scaled, T_scaled).detach().cpu().numpy().reshape(-1)
 
         if T_eval_all.ndim == 2:
             T_eval = np.array(T_eval_all[rep_idx]).reshape(-1)
@@ -133,12 +133,12 @@ def main() -> None:
             mu_eval = mu_eval[:args.eval_n]
 
         a_h = float(np.exp(best_params["log_a_h"]))
-        alpha = float(best_params["alpha"])
+        alpha = float(fixed_params.get("alpha", best_params.get("alpha", 0.05)))
 
-        pred = estimate_adrf_locfit(
+        pred = estimate_adrf_local_poly(
             T_obs=np.asarray(rep.T, dtype=np.float64),
             Y_obs=np.asarray(rep.Y, dtype=np.float64),
-            weights=np.asarray(w, dtype=np.float64),
+            log_weights=np.asarray(logw, dtype=np.float64),
             t_grid=np.asarray(T_eval, dtype=np.float64),
             a_h=a_h,
             alpha=alpha,

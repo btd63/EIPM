@@ -13,50 +13,56 @@ from train_eipm import load_replications_from_npz, EIPM
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--data_dir", type=str, default="./datasets")
-    p.add_argument("--pattern", type=str, default="sim_*nonlinear*.npz")
+    p.add_argument(
+        "--pattern",
+        type=str,
+        default="sim_nonlinear_dx5_ntr1000_nev10000_rpt100_tk5_ok5_pi0.0_seed42.npz",
+    )
     p.add_argument("--ckpt_dir", type=str, default="./models/eipm_single")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--eval_n", type=int, default=0)
     p.add_argument("--max_reps", type=int, default=100)
+    p.add_argument("--only_rep", type=int, default=-1)
     return p.parse_args()
 
 
-def estimate_adrf_locfit(
+def estimate_adrf_local_poly(
     T_obs: np.ndarray,
     Y_obs: np.ndarray,
-    weights: np.ndarray,
+    log_weights: np.ndarray,
     t_grid: np.ndarray,
     a_h: float,
     alpha: float,
 ) -> np.ndarray:
-    try:
-        from rpy2 import robjects as ro
-        from rpy2.robjects import numpy2ri
-        from rpy2.robjects import packages as rpackages
-    except Exception as exc:  # pragma: no cover - environment dependent
-        raise RuntimeError("rpy2 is required to call locfit from Python.") from exc
-
-    if not rpackages.isinstalled("locfit"):
-        raise RuntimeError("R package 'locfit' is required.")
-
-    numpy2ri.activate()
-
-    locfit = rpackages.importr("locfit")
-    base = rpackages.importr("base")
-
-    dfx = ro.DataFrame({"Y": ro.FloatVector(Y_obs), "TRT": ro.FloatVector(T_obs)})
-    w = ro.FloatVector(weights)
-
     preds = []
+    T_obs = np.asarray(T_obs, dtype=np.float64).reshape(-1)
+    Y_obs = np.asarray(Y_obs, dtype=np.float64).reshape(-1)
+    log_weights = np.asarray(log_weights, dtype=np.float64).reshape(-1)
+
     for t_val in t_grid:
-        dist = np.abs(T_obs - float(t_val))
+        t0 = float(t_val)
+        diff = T_obs - t0
+        dist = np.abs(diff)
         dist_q = np.quantile(dist, 0.1)
         h_t = float(a_h) * float(dist_q ** float(alpha))
         if h_t <= 1e-8:
             h_t = 1e-8
-        fit = locfit.locfit(ro.Formula("Y ~ lp(TRT, h=%f)" % h_t), weights=w, data=dfx)
-        pred = base.predict(fit, newdata=ro.FloatVector([float(t_val)]), where="fitp")
-        preds.append(float(pred[0]))
+        u = diff / h_t
+        logk = -0.5 * (u ** 2)
+        logw_eff = log_weights + logk
+        max_log = np.max(logw_eff)
+        w_eff = np.exp(logw_eff - max_log)
+        s = float(np.sum(w_eff))
+        if np.isfinite(s) and s > 0.0:
+            w_eff = w_eff / s
+
+        X_lp = np.stack([np.ones_like(diff), diff], axis=1)  # p=1
+        W = w_eff[:, None]
+        XW = X_lp * W
+        xtwx = X_lp.T @ XW
+        xtwy = XW.T @ Y_obs
+        beta = np.linalg.pinv(xtwx) @ xtwy
+        preds.append(float(beta[0]))
 
     return np.array(preds, dtype=np.float64)
 
@@ -85,15 +91,26 @@ def main() -> None:
 
     for rep_idx in range(n_reps):
         rep = reps[int(rep_idx)]
+        if args.only_rep >= 0 and int(rep.rep_idx) != int(args.only_rep):
+            continue
         ckpt_path = Path(args.ckpt_dir) / f"eipm_single_nonlinear_rep{rep.rep_idx:03d}.pth"
         if not ckpt_path.exists():
             print(f"[WARN] missing checkpoint: {ckpt_path}")
             continue
 
         ckpt = torch.load(ckpt_path, map_location="cpu")
+        ckpt_npz = ckpt.get("npz_path")
+        if ckpt_npz is not None:
+            if Path(ckpt_npz).name != Path(npz_path).name:
+                msg = f"[WARN] ckpt dataset mismatch: {ckpt_npz} != {npz_path}"
+                if args.only_rep >= 0:
+                    raise RuntimeError(msg)
+                print(msg)
+                continue
         best_params = ckpt.get("best_params")
         if best_params is None:
             raise KeyError(f"best_params not found in checkpoint: {ckpt_path}")
+        fixed_params = ckpt.get("fixed_params", {})
         std = ckpt.get("standardize")
         if std is None:
             raise KeyError(f"standardize stats not found in checkpoint: {ckpt_path}")
@@ -102,7 +119,16 @@ def main() -> None:
         depth = int(script_args.get("depth", 2))
         width = int(script_args.get("width", 128))
 
-        model = EIPM(input_dim=int(rep.d_X) + 1, hidden=width, n_layers=depth)
+        expected_in = int(rep.d_X) + 1
+        ckpt_in = int(ckpt["model_state"]["net.0.weight"].shape[1])
+        if ckpt_in != expected_in:
+            msg = f"[WARN] ckpt input_dim mismatch: {ckpt_in} != {expected_in}"
+            if args.only_rep >= 0:
+                raise RuntimeError(msg)
+            print(msg)
+            continue
+
+        model = EIPM(input_dim=expected_in, hidden=width, n_layers=depth)
         model.load_state_dict(ckpt["model_state"])
         model.to(device)
         model.eval()
@@ -120,8 +146,7 @@ def main() -> None:
         T_scaled = (T.view(-1) - t_mean) / t_std
 
         with torch.no_grad():
-            w = torch.exp(model(X_scaled, T_scaled)).detach().cpu().numpy().reshape(-1)
-        w = w / np.mean(w)
+            logw = model(X_scaled, T_scaled).detach().cpu().numpy().reshape(-1)
 
         if T_eval_all.ndim == 2:
             T_eval = np.array(T_eval_all[rep_idx]).reshape(-1)
@@ -135,12 +160,12 @@ def main() -> None:
             mu_eval = mu_eval[:args.eval_n]
 
         a_h = float(np.exp(best_params["log_a_h"]))
-        alpha = float(best_params["alpha"])
+        alpha = float(fixed_params.get("alpha", best_params.get("alpha", 0.05)))
 
-        pred = estimate_adrf_locfit(
+        pred = estimate_adrf_local_poly(
             T_obs=np.asarray(rep.T, dtype=np.float64),
             Y_obs=np.asarray(rep.Y, dtype=np.float64),
-            weights=np.asarray(w, dtype=np.float64),
+            log_weights=np.asarray(logw, dtype=np.float64),
             t_grid=np.asarray(T_eval, dtype=np.float64),
             a_h=a_h,
             alpha=alpha,
@@ -152,6 +177,12 @@ def main() -> None:
         mae_list.append(mae)
 
         print(f"[EIPM] rep={rep.rep_idx:03d} MSE={mse:.6g} MAE={mae:.6g}")
+
+        if args.only_rep >= 0 and int(rep.rep_idx) == int(args.only_rep):
+            print("[PRED] t, mu_hat, mu_true")
+            for t_val, p_val, m_val in zip(T_eval, pred, mu_eval):
+                print(f"{float(t_val):.6g}, {float(p_val):.6g}, {float(m_val):.6g}")
+            break
 
     mse_mean = float(np.mean(np.array(mse_list))) if mse_list else float("nan")
     mae_mean = float(np.mean(np.array(mae_list))) if mae_list else float("nan")

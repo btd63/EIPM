@@ -297,6 +297,8 @@ def objective_cv_mse(
     min_delta: float = 1e-3,
     n_splits: int = 5,
     seed: int = 42,
+    log_a_h_low: float = -1.0,
+    log_a_h_high: float = 1.0,
 ) -> float:
     """
     Tune hyperparameters by K-fold CV on the TRAIN set only.
@@ -307,7 +309,7 @@ def objective_cv_mse(
       - We do not use any eval data (T_eval, mu_eval) from DGP.
     """
     log_a_sigma = trial.suggest_float("log_a_sigma", -2.0, 2.0)
-    log_a_h = trial.suggest_float("log_a_h", -2.0, 2.0)
+    log_a_h = trial.suggest_float("log_a_h", float(log_a_h_low), float(log_a_h_high))
     alpha = trial.suggest_float("alpha", 0.05, 0.95)
 
     a_sigma = math.exp(float(log_a_sigma))
@@ -901,31 +903,75 @@ def main() -> None:
                 X_scaled_tune = X_std_tune / math.sqrt(float(rep.d_X))
                 T_scaled_tune = T_std_tune.view(-1)
 
-                def _obj(trial):
-                    return objective_cv_mse(
-                        trial=trial,
-                        X_scaled=X_scaled_tune,
-                        T_scaled=T_scaled_tune,
-                        Y=Y_tune,
-                        input_dim=input_dim,
-                        device=device,
-                        depth=depth,
-                        width=width,
-                        max_steps=int(args.max_steps),
-                        patience=int(args.patience),
-                        min_delta=float(args.min_delta),
-                        n_splits=int(args.k_folds),
-                        seed=int(args.seed),
-                    )
+                def _boundary_tol(n_trials: int, width: float) -> float:
+                    rel = max(0.05, 1.0 / (2.0 * math.sqrt(max(1, int(n_trials)))))
+                    return rel * float(width)
 
                 t_tune0 = time.time()
-                study = optuna.create_study(direction="minimize")
-                study.optimize(_obj, n_trials=int(args.n_trials), show_progress_bar=False)
-                t_tune1 = time.time()
+                log_a_h_low = -1.0
+                log_a_h_high = 1.0
+                expand_factor = 4.0
+                max_expand = 5
 
-                best_params = study.best_params
-                best_value = float(study.best_value)
-                best_trial_num = int(study.best_trial.number)
+                best_params = None
+                best_value = float("inf")
+                best_trial_num = -1
+
+                for expand_i in range(max_expand + 1):
+                    def _obj_local(trial, low=log_a_h_low, high=log_a_h_high):
+                        return objective_cv_mse(
+                            trial=trial,
+                            X_scaled=X_scaled_tune,
+                            T_scaled=T_scaled_tune,
+                            Y=Y_tune,
+                            input_dim=input_dim,
+                            device=device,
+                            depth=depth,
+                            width=width,
+                            max_steps=int(args.max_steps),
+                            patience=int(args.patience),
+                            min_delta=float(args.min_delta),
+                            n_splits=int(args.k_folds),
+                            seed=int(args.seed),
+                            log_a_h_low=low,
+                            log_a_h_high=high,
+                        )
+
+                    study = optuna.create_study(direction="minimize")
+                    study.optimize(_obj_local, n_trials=int(args.n_trials), show_progress_bar=False)
+
+                    if float(study.best_value) < float(best_value):
+                        best_params = study.best_params
+                        best_value = float(study.best_value)
+                        best_trial_num = int(study.best_trial.number)
+
+                    best_log = float(study.best_params["log_a_h"])
+                    width = log_a_h_high - log_a_h_low
+                    tol = _boundary_tol(int(args.n_trials), width)
+                    at_low = best_log <= (log_a_h_low + tol)
+                    at_high = best_log >= (log_a_h_high - tol)
+                    if not (at_low or at_high):
+                        break
+                    if expand_i == max_expand:
+                        break
+                    width = log_a_h_high - log_a_h_low
+                    center = (log_a_h_low + log_a_h_high) * 0.5
+                    new_half = 0.5 * float(expand_factor) * width
+                    if at_high and not at_low:
+                        log_a_h_low = center
+                        log_a_h_high = center + new_half
+                    elif at_low and not at_high:
+                        log_a_h_low = center - new_half
+                        log_a_h_high = center
+                    else:
+                        log_a_h_low = center - new_half
+                        log_a_h_high = center + new_half
+                    print(
+                        f"[TUNE] expand log_a_h to [{log_a_h_low:.3g}, {log_a_h_high:.3g}] "
+                        f"(best_log={best_log:.3g}, tol={tol:.3g})"
+                    )
+
+                t_tune1 = time.time()
 
                 atomic_write_json(
                     hp_path,
