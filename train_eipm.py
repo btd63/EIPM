@@ -41,6 +41,13 @@ except Exception:
 # 0. Utility
 # ============================================================
 
+_T_TRANSFORM = "log1p"
+
+
+def _transform_t(T: Tensor) -> Tensor:
+    return torch.log1p(T)
+
+
 def _locfit_modules():
     try:
         from rpy2 import robjects as ro
@@ -66,6 +73,7 @@ def locfit_mu_at_t(
     t_val: Tensor,
     a_h: float,
     alpha: float,
+    global_q: float,
 ) -> Tensor:
     # w_i = exp(s(X_i, t)) with t fixed, then weighted locfit at t
     t_fixed = t_val.view(1).repeat(X_tr.shape[0]).view(-1, 1)
@@ -75,11 +83,16 @@ def locfit_mu_at_t(
     T_np = T_tr.detach().cpu().numpy()
     Y_np = Y_tr.detach().cpu().numpy()
 
-    # h(t) = a_h * dist(t)^alpha, dist(t)=0.1-quantile of |T_i - t|
+    # h(t) = a_h * (a(t) + global_q)^alpha
+    # a(t) = 0.1-quantile of nonzero |T_i - t|
+    # global_q = 0.1-quantile of nonzero |T_i - T_j|, i != j
     with torch.no_grad():
         dist = torch.abs(T_tr.view(-1) - t_val.view(()))
-        dist_q = torch.quantile(dist, 0.1)
-        h_t = float(a_h) * float(dist_q.item() ** float(alpha))
+        dist_q = _nonzero_quantile_1d(dist, 0.1)
+        base = float(dist_q.item() + float(global_q))
+        if base <= 0.0:
+            base = 1e-8
+        h_t = float(a_h) * float(base ** float(alpha))
         if h_t <= 1e-8:
             h_t = 1e-8
 
@@ -217,6 +230,42 @@ def get_med(x: Tensor, max_n: int = 500) -> float:
     return float(torch.median(d).item())
 
 
+@torch.no_grad()
+def _nonzero_quantile_1d(x: Tensor, q: float) -> Tensor:
+    x = x.view(-1)
+    x_nz = x[x > 0]
+    if x_nz.numel() == 0:
+        return x.new_tensor(0.0)
+    return torch.quantile(x_nz, q)
+
+
+@torch.no_grad()
+def _nonzero_quantile_cols(dist: Tensor, q: float) -> Tensor:
+    qs = []
+    for j in range(dist.shape[1]):
+        col = dist[:, j]
+        col_nz = col[col > 0]
+        if col_nz.numel() == 0:
+            qs.append(dist.new_tensor(0.0))
+        else:
+            qs.append(torch.quantile(col_nz, q))
+    return torch.stack(qs)
+
+
+@torch.no_grad()
+def _compute_bandwidth_stats(T_train: Tensor, q: float) -> Tuple[Tensor, float]:
+    T_flat = T_train.view(-1, 1)
+    dist = torch.abs(T_flat - T_flat.t())
+    dist_flat = dist.view(-1)
+    dist_nz = dist_flat[dist_flat > 0]
+    if dist_nz.numel() == 0:
+        global_q = 0.0
+    else:
+        global_q = float(torch.quantile(dist_nz, q).item())
+    a_vec = _nonzero_quantile_cols(dist, q)
+    return a_vec, global_q
+
+
 # ============================================================
 # 3. EIPM loss
 # ============================================================
@@ -237,16 +286,35 @@ def h0_t(
     *,
     a_h: float,
     alpha: float,
+    global_q: float,
+    a_vec: Optional[Tensor] = None,
 ) -> Tensor:
+    if a_vec is not None:
+        base = a_vec + float(global_q)
+        base = torch.clamp(base, min=0.0)
+        h = float(a_h) * (base ** float(alpha))
+        return h.clamp_min(1e-8).view(-1, 1)
+
     T_tr = T_train.view(-1, 1)
     t_q = t.view(1, -1)
     dist = torch.abs(T_tr - t_q)  # (n,m)
-    dist_q = torch.quantile(dist, 0.1, dim=0)
-    h = float(a_h) * (dist_q ** float(alpha))
+    dist_q = _nonzero_quantile_cols(dist, 0.1)
+    base = dist_q + float(global_q)
+    base = torch.clamp(base, min=0.0)
+    h = float(a_h) * (base ** float(alpha))
     return h.clamp_min(1e-8).view(-1, 1)
 
 
-def compute_eipm_loss(model: nn.Module, X: Tensor, T: Tensor, a_sigma: float, a_h: float, alpha: float) -> Tensor:
+def compute_eipm_loss(
+    model: nn.Module,
+    X: Tensor,
+    T: Tensor,
+    a_sigma: float,
+    a_h: float,
+    alpha: float,
+    a_vec: Tensor,
+    global_q: float,
+) -> Tensor:
     r"""
     EIPM loss (empirical MMD^2 averaged over target indices i):
     For each target i (with t_i = T_i), define weights over j:
@@ -259,7 +327,14 @@ def compute_eipm_loss(model: nn.Module, X: Tensor, T: Tensor, a_sigma: float, a_
     T_flat = T.view(-1, 1)
     dist_sq_T = (T_flat - T_flat.t()) ** 2  # (n,n)
 
-    h_T_vec = h0_t(T_train=T, t=T, a_h=float(a_h), alpha=float(alpha))
+    h_T_vec = h0_t(
+        T_train=T,
+        t=T,
+        a_h=float(a_h),
+        alpha=float(alpha),
+        global_q=global_q,
+        a_vec=a_vec,
+    )
     h_T_vec = h_T_vec.view(-1, 1)
     H = (h_T_vec @ h_T_vec.t()).clamp_min(1e-8)  # (n,n)
     K_T = torch.exp(-0.5 * dist_sq_T / H)        # (n,n)
@@ -304,7 +379,9 @@ def objective_cv_mse(
     Tune hyperparameters by K-fold CV on the TRAIN set only.
 
     Key point for bandwidth:
-      - We use h(t) = a_h * dist(t)^alpha with dist(t)=0.1-quantile of |T_i - t|.
+      - We use h(t) = a_h * (a(t) + q_global)^alpha.
+      - a(t) = 0.1-quantile of nonzero |T_i - t|.
+      - q_global = 0.1-quantile of nonzero |T_i - T_j|, i != j.
       - The same h(t) is used both in K_T and in locfit during CV.
       - We do not use any eval data (T_eval, mu_eval) from DGP.
     """
@@ -338,6 +415,7 @@ def objective_cv_mse(
 
         X_tr, T_tr, Y_tr = X_scaled[tr], T_scaled[tr], Y[tr]
         X_va, T_va, Y_va = X_scaled[va], T_scaled[va], Y[va]
+        a_vec_tr, global_q_tr = _compute_bandwidth_stats(T_tr, 0.1)
 
         # inner training (short, for tuning)
         model = EIPM(input_dim=input_dim, hidden=width, n_layers=depth).to(device)
@@ -347,7 +425,7 @@ def objective_cv_mse(
         no_improve = 0
         for it in range(int(max_steps)):
             opt.zero_grad(set_to_none=True)
-            loss = compute_eipm_loss(model, X_tr, T_tr, a_sigma, a_h, alpha)
+            loss = compute_eipm_loss(model, X_tr, T_tr, a_sigma, a_h, alpha, a_vec_tr, global_q_tr)
             if not torch.isfinite(loss):
                 raise RuntimeError(
                     "EIPM loss is not finite: "
@@ -361,7 +439,16 @@ def objective_cv_mse(
                 model.eval()
                 preds = []
                 for i in range(T_va.numel()):
-                    mu_i = locfit_mu_at_t(model=model, X_tr=X_tr, T_tr=T_tr, Y_tr=Y_tr, t_val=T_va[i], a_h=a_h, alpha=alpha)
+                    mu_i = locfit_mu_at_t(
+                        model=model,
+                        X_tr=X_tr,
+                        T_tr=T_tr,
+                        Y_tr=Y_tr,
+                        t_val=T_va[i],
+                        a_h=a_h,
+                        alpha=alpha,
+                        global_q=global_q_tr,
+                    )
                     preds.append(mu_i)
                 pred = torch.stack(preds).view(-1)
                 mse = torch.mean((pred - Y_va.view(-1)) ** 2).item()
@@ -378,7 +465,16 @@ def objective_cv_mse(
             model.eval()
             preds = []
             for i in range(T_va.numel()):
-                mu_i = locfit_mu_at_t(model=model, X_tr=X_tr, T_tr=T_tr, Y_tr=Y_tr, t_val=T_va[i], a_h=a_h, alpha=alpha)
+                mu_i = locfit_mu_at_t(
+                    model=model,
+                    X_tr=X_tr,
+                    T_tr=T_tr,
+                    Y_tr=Y_tr,
+                    t_val=T_va[i],
+                    a_h=a_h,
+                    alpha=alpha,
+                    global_q=global_q_tr,
+                )
                 preds.append(mu_i)
             pred = torch.stack(preds).view(-1)
             best_mse = float(torch.mean((pred - Y_va.view(-1)) ** 2).item())
@@ -432,6 +528,7 @@ def train_folds_for_params(
 
         X_tr, T_tr, Y_tr = X_scaled[tr], T_scaled[tr], Y[tr]
         X_va, T_va, Y_va = X_scaled[va], T_scaled[va], Y[va]
+        a_vec_tr, global_q_tr = _compute_bandwidth_stats(T_tr, 0.1)
 
         model = EIPM(input_dim=input_dim, hidden=width, n_layers=depth).to(device)
         opt = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -440,7 +537,7 @@ def train_folds_for_params(
         no_improve = 0
         for it in range(int(max_steps)):
             opt.zero_grad(set_to_none=True)
-            loss = compute_eipm_loss(model, X_tr, T_tr, a_sigma, a_h, alpha)
+            loss = compute_eipm_loss(model, X_tr, T_tr, a_sigma, a_h, alpha, a_vec_tr, global_q_tr)
             loss.backward()
             opt.step()
 
@@ -448,7 +545,18 @@ def train_folds_for_params(
                 model.eval()
                 preds = []
                 for i in range(T_va.numel()):
-                    preds.append(locfit_mu_at_t(model=model, X_tr=X_tr, T_tr=T_tr, Y_tr=Y_tr, t_val=T_va[i], a_h=a_h, alpha=alpha))
+                    preds.append(
+                        locfit_mu_at_t(
+                            model=model,
+                            X_tr=X_tr,
+                            T_tr=T_tr,
+                            Y_tr=Y_tr,
+                            t_val=T_va[i],
+                            a_h=a_h,
+                            alpha=alpha,
+                            global_q=global_q_tr,
+                        )
+                    )
                 pred = torch.stack(preds).view(-1)
                 mse = torch.mean((pred - Y_va.view(-1)) ** 2).item()
                 if mse < best_mse - float(min_delta):
@@ -464,7 +572,18 @@ def train_folds_for_params(
             model.eval()
             preds = []
             for i in range(T_va.numel()):
-                preds.append(locfit_mu_at_t(model=model, X_tr=X_tr, T_tr=T_tr, Y_tr=Y_tr, t_val=T_va[i], a_h=a_h, alpha=alpha))
+                preds.append(
+                    locfit_mu_at_t(
+                        model=model,
+                        X_tr=X_tr,
+                        T_tr=T_tr,
+                        Y_tr=Y_tr,
+                        t_val=T_va[i],
+                        a_h=a_h,
+                        alpha=alpha,
+                        global_q=global_q_tr,
+                    )
+                )
             pred = torch.stack(preds).view(-1)
             best_mse = float(torch.mean((pred - Y_va.view(-1)) ** 2).item())
 
@@ -504,6 +623,7 @@ def train_final_model_full(
     with torch.no_grad():
         d_med = get_med(X_scaled)
         sigma = float(a_sigma) * float(d_med)
+        a_vec_full, global_q_full = _compute_bandwidth_stats(T_scaled, 0.1)
 
     n = int(X_scaled.shape[0])
     splitter = KFold(n_splits=int(k_folds), shuffle=True, random_state=seed)
@@ -517,7 +637,16 @@ def train_final_model_full(
     for ep in range(int(epochs)):
         model.train()
         opt.zero_grad(set_to_none=True)
-        loss = compute_eipm_loss(model, X_scaled, T_scaled, a_sigma, a_h, alpha)
+        loss = compute_eipm_loss(
+            model,
+            X_scaled,
+            T_scaled,
+            a_sigma,
+            a_h,
+            alpha,
+            a_vec_full,
+            global_q_full,
+        )
         loss.backward()
         opt.step()
 
@@ -537,11 +666,33 @@ def train_final_model_full(
                 va = torch.as_tensor(va_idx, device=device, dtype=torch.long)
                 X_tr, T_tr, Y_tr = X_scaled[tr], T_scaled[tr], Y[tr]
                 X_va, T_va, Y_va = X_scaled[va], T_scaled[va], Y[va]
+                _, global_q_tr = _compute_bandwidth_stats(T_tr, 0.1)
+                a_vec_va, global_q_va = _compute_bandwidth_stats(T_va, 0.1)
 
-                val_eipm = compute_eipm_loss(model, X_va, T_va, a_sigma, a_h, alpha)
+                val_eipm = compute_eipm_loss(
+                    model,
+                    X_va,
+                    T_va,
+                    a_sigma,
+                    a_h,
+                    alpha,
+                    a_vec_va,
+                    global_q_va,
+                )
                 preds = []
                 for i in range(T_va.numel()):
-                    preds.append(locfit_mu_at_t(model=model, X_tr=X_tr, T_tr=T_tr, Y_tr=Y_tr, t_val=T_va[i], a_h=a_h, alpha=alpha))
+                    preds.append(
+                        locfit_mu_at_t(
+                            model=model,
+                            X_tr=X_tr,
+                            T_tr=T_tr,
+                            Y_tr=Y_tr,
+                            t_val=T_va[i],
+                            a_h=a_h,
+                            alpha=alpha,
+                            global_q=global_q_tr,
+                        )
+                    )
                 pred = torch.stack(preds).view(-1)
                 val_mse = torch.mean((pred - Y_va.view(-1)) ** 2)
 
@@ -896,7 +1047,8 @@ def main() -> None:
 
             if best_params is None or best_value is None:
                 X_tune = torch.tensor(rep.X, dtype=torch.float32, device=device)
-                T_tune = torch.tensor(rep.T, dtype=torch.float32, device=device)
+                T_tune_raw = torch.tensor(rep.T, dtype=torch.float32, device=device)
+                T_tune = _transform_t(T_tune_raw)
                 Y_tune = torch.tensor(rep.Y, dtype=torch.float32, device=device)
 
                 X_std_tune, T_std_tune, _, _, _, _ = standardize_train(X_tune, T_tune)
@@ -990,7 +1142,8 @@ def main() -> None:
                 }
 
                 X_tune = torch.tensor(rep.X, dtype=torch.float32, device=device)
-                T_tune = torch.tensor(rep.T, dtype=torch.float32, device=device)
+                T_tune_raw = torch.tensor(rep.T, dtype=torch.float32, device=device)
+                T_tune = _transform_t(T_tune_raw)
                 Y_tune = torch.tensor(rep.Y, dtype=torch.float32, device=device)
                 X_std_tune, T_std_tune, _, _, _, _ = standardize_train(X_tune, T_tune)
                 X_scaled_tune = X_std_tune / math.sqrt(float(rep.d_X))
@@ -1062,7 +1215,8 @@ def main() -> None:
                 }
             else:
                 X = torch.tensor(rep.X, dtype=torch.float32, device=device)
-                T = torch.tensor(rep.T, dtype=torch.float32, device=device)
+                T_raw = torch.tensor(rep.T, dtype=torch.float32, device=device)
+                T = _transform_t(T_raw)
                 Y = torch.tensor(rep.Y, dtype=torch.float32, device=device)
 
                 X_std, T_std, _, _, _, _ = standardize_train(X, T)
@@ -1088,7 +1242,8 @@ def main() -> None:
 
             X_raw = torch.tensor(rep.X, dtype=torch.float32, device=device)
             T_raw = torch.tensor(rep.T, dtype=torch.float32, device=device)
-            _, _, x_mean_t, x_std_t, t_mean_t, t_std_t = standardize_train(X_raw, T_raw)
+            T_trans = _transform_t(T_raw)
+            _, _, x_mean_t, x_std_t, t_mean_t, t_std_t = standardize_train(X_raw, T_trans)
 
             atomic_torch_save(
                 ckpt_path,
@@ -1106,6 +1261,7 @@ def main() -> None:
                         "t_mean": float(t_mean_t),
                         "t_std": float(t_std_t),
                     },
+                    "t_transform": _T_TRANSFORM,
                     "rep_meta": rep.meta,
                     "script_args": vars(args),
                 },

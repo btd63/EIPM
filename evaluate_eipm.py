@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import os
 from pathlib import Path
 
 import numpy as np
@@ -18,7 +19,42 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--eval_n", type=int, default=0)
     p.add_argument("--max_reps", type=int, default=100)
+    p.add_argument("--organize_ckpts", action="store_true", help="Move mixed checkpoints into dataset subfolders.")
+    p.add_argument("--plot_h", action="store_true", help="Save h(t) curve plot for a rep.")
+    p.add_argument("--plot_rep", type=int, default=-1, help="Replication index for h(t) plot.")
+    p.add_argument("--plot_h_n", type=int, default=200, help="Number of grid points for h(t) plot.")
+    p.add_argument("--only_rep", type=int, default=-1, help="Evaluate only this replication index.")
+    p.add_argument("--top_k_errors", type=int, default=0, help="Print top-k |mu_hat-mu_true| rows.")
+    p.add_argument("--debug_topk", action="store_true", help="Print local-linear diagnostics for top-k errors.")
+    p.add_argument("--plot_train_hist", action="store_true", help="Save histogram of T_train for a rep.")
+    p.add_argument("--hist_rep", type=int, default=-1, help="Replication index for T_train histogram.")
+    p.add_argument("--hist_bins", type=int, default=50, help="Number of bins for T_train histogram.")
     return p.parse_args()
+
+
+def _nonzero_quantile(x: np.ndarray, q: float) -> float:
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    x_nz = x[x > 0]
+    if x_nz.size == 0:
+        return 0.0
+    return float(np.quantile(x_nz, q))
+
+
+def _apply_t_transform(x: np.ndarray, kind: str) -> np.ndarray:
+    if kind in (None, "identity"):
+        return np.asarray(x, dtype=np.float64)
+    if kind == "log1p":
+        return np.log1p(np.asarray(x, dtype=np.float64))
+    raise ValueError(f"Unknown t_transform: {kind}")
+
+
+def _pairwise_nonzero_quantile(T: np.ndarray, q: float) -> float:
+    T = np.asarray(T, dtype=np.float64).reshape(-1)
+    dist = np.abs(T[:, None] - T[None, :]).reshape(-1)
+    dist = dist[dist > 0]
+    if dist.size == 0:
+        return 0.0
+    return float(np.quantile(dist, q))
 
 
 def estimate_adrf_local_poly(
@@ -33,13 +69,17 @@ def estimate_adrf_local_poly(
     T_obs = np.asarray(T_obs, dtype=np.float64).reshape(-1)
     Y_obs = np.asarray(Y_obs, dtype=np.float64).reshape(-1)
     log_weights = np.asarray(log_weights, dtype=np.float64).reshape(-1)
+    global_q = _pairwise_nonzero_quantile(T_obs, 0.1)
 
     for t_val in t_grid:
         t0 = float(t_val)
         diff = T_obs - t0
         dist = np.abs(diff)
-        dist_q = np.quantile(dist, 0.1)
-        h_t = float(a_h) * float(dist_q ** float(alpha))
+        dist_q = _nonzero_quantile(dist, 0.1)
+        base = float(dist_q + global_q)
+        if base <= 0.0:
+            base = 1e-8
+        h_t = float(a_h) * float(base ** float(alpha))
         if h_t <= 1e-8:
             h_t = 1e-8
         u = diff / h_t
@@ -61,6 +101,149 @@ def estimate_adrf_local_poly(
     return np.array(preds, dtype=np.float64)
 
 
+def _h_curve(
+    T_obs: np.ndarray,
+    t_grid: np.ndarray,
+    a_h: float,
+    alpha: float,
+) -> np.ndarray:
+    T_obs = np.asarray(T_obs, dtype=np.float64).reshape(-1)
+    t_grid = np.asarray(t_grid, dtype=np.float64).reshape(-1)
+    global_q = _pairwise_nonzero_quantile(T_obs, 0.1)
+    h_vals = []
+    for t_val in t_grid:
+        diff = T_obs - float(t_val)
+        dist_q = _nonzero_quantile(np.abs(diff), 0.1)
+        base = float(dist_q + global_q)
+        if base <= 0.0:
+            base = 1e-8
+        h_t = float(a_h) * float(base ** float(alpha))
+        if h_t <= 1e-8:
+            h_t = 1e-8
+        h_vals.append(h_t)
+    return np.array(h_vals, dtype=np.float64)
+
+
+def _local_linear_debug(
+    T_obs: np.ndarray,
+    Y_obs: np.ndarray,
+    logw: np.ndarray,
+    t0: float,
+    a_h: float,
+    alpha: float,
+) -> dict:
+    T = np.asarray(T_obs, dtype=np.float64).reshape(-1)
+    Y = np.asarray(Y_obs, dtype=np.float64).reshape(-1)
+    logw = np.asarray(logw, dtype=np.float64).reshape(-1)
+
+    diff = T - float(t0)
+    dist = np.abs(diff)
+    dist_q = _nonzero_quantile(dist, 0.1)
+    global_q = _pairwise_nonzero_quantile(T, 0.1)
+    base = float(dist_q + global_q)
+    if base <= 0.0:
+        base = 1e-8
+    h = float(a_h) * float(base ** float(alpha))
+    if h <= 1e-8:
+        h = 1e-8
+
+    u = diff / h
+    logk = -0.5 * (u ** 2)
+    logw_eff = logw + logk
+    max_log = np.max(logw_eff)
+    w = np.exp(logw_eff - max_log)
+    s = float(np.sum(w))
+    if np.isfinite(s) and s > 0.0:
+        w = w / s
+
+    s0 = float(np.sum(w))
+    s1 = float(np.sum(w * diff))
+    s2 = float(np.sum(w * diff * diff))
+    denom = (s0 * s2 - s1 * s1)
+
+    l = w * (s2 - diff * s1) / (denom + 1e-12)
+    mu_hat = float(np.sum(l * Y))
+    ess = float(1.0 / np.sum(w * w)) if np.any(w) else 0.0
+    X_lp = np.stack([np.ones_like(diff), diff], axis=1)
+    xtwx = X_lp.T @ (X_lp * w[:, None])
+    try:
+        cond = float(np.linalg.cond(xtwx))
+    except Exception:
+        cond = float("inf")
+
+    return {
+        "t": float(t0),
+        "h": float(h),
+        "denom": float(denom),
+        "min_l": float(np.min(l)),
+        "max_l": float(np.max(l)),
+        "neg_cnt": int(np.sum(l < 0)),
+        "ess": float(ess),
+        "cond": float(cond),
+        "mu_hat": float(mu_hat),
+    }
+
+
+def _save_h_plot(t_grid: np.ndarray, h_vals: np.ndarray, out_path: Path) -> None:
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        raise RuntimeError("matplotlib is required for plotting h(t).") from exc
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.plot(t_grid, h_vals, color="black", linewidth=1.5)
+    ax.set_xlabel("t")
+    ax.set_ylabel("h(t)")
+    ax.grid(True, alpha=0.2)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def _save_hist_plot(t_vals: np.ndarray, out_path: Path, bins: int, rep_idx: int, *, title: str) -> None:
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        raise RuntimeError("matplotlib is required for plotting histogram.") from exc
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.hist(t_vals, bins=int(bins), color="steelblue", edgecolor="white")
+    ax.set_title(title)
+    ax.set_xlabel("T")
+    ax.set_ylabel("count")
+    ax.grid(True, alpha=0.2)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+def _organize_checkpoints(ckpt_root: Path) -> None:
+    ckpt_root.mkdir(parents=True, exist_ok=True)
+    moved = 0
+    for ckpt_path in ckpt_root.glob("*.pth"):
+        try:
+            ckpt = torch.load(ckpt_path, map_location="cpu")
+        except Exception:
+            continue
+        npz_path = ckpt.get("npz_path")
+        if not npz_path:
+            continue
+        dataset_tag = Path(npz_path).stem
+        target_dir = ckpt_root / dataset_tag
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_path = target_dir / ckpt_path.name
+        if target_path == ckpt_path:
+            continue
+        os.replace(ckpt_path, target_path)
+        moved += 1
+    if moved > 0:
+        print(f"[INFO] Organized {moved} checkpoint(s) under {ckpt_root}")
+
+
 def main() -> None:
     args = parse_args()
     device = torch.device(args.device)
@@ -70,6 +253,11 @@ def main() -> None:
         raise FileNotFoundError(f"No npz files found in {args.data_dir} with pattern {args.pattern}")
 
     npz_path = files[0]
+    ckpt_root = Path(args.ckpt_dir)
+    if args.organize_ckpts:
+        _organize_checkpoints(ckpt_root)
+    dataset_tag = Path(npz_path).stem
+    ckpt_dir = ckpt_root / dataset_tag if (ckpt_root / dataset_tag).exists() else ckpt_root
     reps = load_replications_from_npz(npz_path)
     data = np.load(npz_path, allow_pickle=True)
     if "T_eval" not in data.files or "mu_eval" not in data.files:
@@ -83,12 +271,19 @@ def main() -> None:
 
     for rep_idx in range(n_reps):
         rep = reps[int(rep_idx)]
-        ckpt_path = Path(args.ckpt_dir) / f"eipm_single_nonlinear_rep{rep.rep_idx:03d}.pth"
+        if args.only_rep >= 0 and int(rep.rep_idx) != int(args.only_rep):
+            continue
+        ckpt_path = ckpt_dir / f"eipm_single_nonlinear_rep{rep.rep_idx:03d}.pth"
         if not ckpt_path.exists():
             print(f"[WARN] missing checkpoint: {ckpt_path}")
             continue
 
         ckpt = torch.load(ckpt_path, map_location="cpu")
+        ckpt_npz = ckpt.get("npz_path")
+        if ckpt_npz is not None:
+            if Path(ckpt_npz).name != Path(npz_path).name:
+                print(f"[WARN] ckpt dataset mismatch: {ckpt_npz} != {npz_path}")
+                continue
         best_params = ckpt.get("best_params")
         if best_params is None:
             raise KeyError(f"best_params not found in checkpoint: {ckpt_path}")
@@ -96,18 +291,30 @@ def main() -> None:
         std = ckpt.get("standardize")
         if std is None:
             raise KeyError(f"standardize stats not found in checkpoint: {ckpt_path}")
+        t_transform = ckpt.get("t_transform", "identity")
 
         script_args = ckpt.get("script_args", {})
         depth = int(script_args.get("depth", 2))
         width = int(script_args.get("width", 128))
 
-        model = EIPM(input_dim=int(rep.d_X) + 1, hidden=width, n_layers=depth)
+        expected_in = int(rep.d_X) + 1
+        ckpt_in = int(ckpt["model_state"]["net.0.weight"].shape[1])
+        if ckpt_in != expected_in:
+            print(f"[WARN] ckpt input_dim mismatch: {ckpt_in} != {expected_in}")
+            continue
+        model = EIPM(input_dim=expected_in, hidden=width, n_layers=depth)
         model.load_state_dict(ckpt["model_state"])
         model.to(device)
         model.eval()
 
         X = torch.tensor(rep.X, dtype=torch.float32, device=device)
-        T = torch.tensor(rep.T, dtype=torch.float32, device=device)
+        T_raw = torch.tensor(rep.T, dtype=torch.float32, device=device)
+        if t_transform == "log1p":
+            T = torch.log1p(T_raw)
+        elif t_transform in (None, "identity"):
+            T = T_raw
+        else:
+            raise ValueError(f"Unknown t_transform in checkpoint: {t_transform}")
 
         x_mean = torch.tensor(np.asarray(std["x_mean"]), dtype=torch.float32, device=device).view(1, -1)
         x_std = torch.tensor(np.asarray(std["x_std"]), dtype=torch.float32, device=device).view(1, -1)
@@ -135,11 +342,55 @@ def main() -> None:
         a_h = float(np.exp(best_params["log_a_h"]))
         alpha = float(fixed_params.get("alpha", best_params.get("alpha", 0.05)))
 
+        T_obs_np = _apply_t_transform(rep.T, t_transform)
+        T_eval_np = _apply_t_transform(T_eval, t_transform)
+        t_mean_np = float(std["t_mean"])
+        t_std_np = float(std["t_std"])
+        T_obs_scaled = (T_obs_np.reshape(-1) - t_mean_np) / t_std_np
+        T_eval_scaled = (T_eval_np.reshape(-1) - t_mean_np) / t_std_np
+
+        if args.plot_h and (args.plot_rep < 0 or int(rep.rep_idx) == int(args.plot_rep)):
+            t_min = float(np.min(T_eval))
+            t_max = float(np.max(T_eval))
+            n_plot = int(max(10, args.plot_h_n))
+            t_grid = np.linspace(t_min, t_max, n_plot)
+            t_grid_scaled = (_apply_t_transform(t_grid, t_transform).reshape(-1) - t_mean_np) / t_std_np
+            h_vals = _h_curve(
+                T_obs=np.asarray(T_obs_scaled, dtype=np.float64),
+                t_grid=np.asarray(t_grid_scaled, dtype=np.float64),
+                a_h=a_h,
+                alpha=alpha,
+            )
+            out_path = ckpt_dir / f"h_curve_rep{rep.rep_idx:03d}.png"
+            _save_h_plot(t_grid, h_vals, out_path)
+            print(f"[INFO] Saved h(t) plot: {out_path}")
+
+        if args.plot_train_hist and (args.hist_rep < 0 or int(rep.rep_idx) == int(args.hist_rep)):
+            out_path = ckpt_dir / f"hist_T_train_rep{rep.rep_idx:03d}.png"
+            _save_hist_plot(
+                t_vals=np.asarray(rep.T, dtype=np.float64),
+                out_path=out_path,
+                bins=int(args.hist_bins),
+                rep_idx=int(rep.rep_idx),
+                title=f"T_train histogram (rep {rep.rep_idx})",
+            )
+            print(f"[INFO] Saved T_train hist: {out_path}")
+
+            out_path_log = ckpt_dir / f"hist_log1p_T_train_rep{rep.rep_idx:03d}.png"
+            _save_hist_plot(
+                t_vals=np.log1p(np.asarray(rep.T, dtype=np.float64)),
+                out_path=out_path_log,
+                bins=int(args.hist_bins),
+                rep_idx=int(rep.rep_idx),
+                title=f"log1p(T_train) histogram (rep {rep.rep_idx})",
+            )
+            print(f"[INFO] Saved log1p(T_train) hist: {out_path_log}")
+
         pred = estimate_adrf_local_poly(
-            T_obs=np.asarray(rep.T, dtype=np.float64),
+            T_obs=np.asarray(T_obs_scaled, dtype=np.float64),
             Y_obs=np.asarray(rep.Y, dtype=np.float64),
             log_weights=np.asarray(logw, dtype=np.float64),
-            t_grid=np.asarray(T_eval, dtype=np.float64),
+            t_grid=np.asarray(T_eval_scaled, dtype=np.float64),
             a_h=a_h,
             alpha=alpha,
         )
@@ -157,6 +408,34 @@ def main() -> None:
         mae_list.append(mae)
 
         print(f"[EIPM] rep={rep.rep_idx:03d} MSE={mse:.6g} MAE={mae:.6g}")
+
+        if args.top_k_errors and int(args.top_k_errors) > 0:
+            k = int(args.top_k_errors)
+            abs_err = np.abs(pred - mu_eval)
+            k = min(k, abs_err.shape[0])
+            idx = np.argsort(abs_err)[-k:][::-1]
+            print("[TOPK] t, mu_hat, mu_true, abs_err")
+            for i in idx:
+                print(
+                    f"{float(T_eval[i]):.6g}, {float(pred[i]):.6g}, "
+                    f"{float(mu_eval[i]):.6g}, {float(abs_err[i]):.6g}"
+                )
+            if args.debug_topk:
+                print("[DBG] t, h, denom, min_l, max_l, neg_cnt, ess, cond, mu_hat_dbg")
+                for i in idx:
+                    dbg = _local_linear_debug(
+                        T_obs=np.asarray(T_obs_scaled, dtype=np.float64),
+                        Y_obs=np.asarray(rep.Y, dtype=np.float64),
+                        logw=np.asarray(logw, dtype=np.float64),
+                        t0=float(T_eval_scaled[i]),
+                        a_h=a_h,
+                        alpha=alpha,
+                    )
+                    print(
+                        f"{dbg['t']:.6g}, {dbg['h']:.6g}, {dbg['denom']:.6g}, "
+                        f"{dbg['min_l']:.6g}, {dbg['max_l']:.6g}, {dbg['neg_cnt']}, "
+                        f"{dbg['ess']:.6g}, {dbg['cond']:.6g}, {dbg['mu_hat']:.6g}"
+                    )
 
     mse_rms = float(np.sqrt(np.mean(np.square(np.array(mse_list))))) if mse_list else float("nan")
     mae_mean = float(np.mean(np.array(mae_list))) if mae_list else float("nan")

@@ -15,7 +15,7 @@ import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import optuna
@@ -25,6 +25,11 @@ import torch.optim as optim
 from sklearn.model_selection import KFold, StratifiedKFold
 from torch import Tensor
 
+_T_TRANSFORM = "log1p"
+
+
+def _transform_t(T: Tensor) -> Tensor:
+    return torch.log1p(T)
 
 def local_poly_mu_at_t(
     X_tr: Tensor,
@@ -34,6 +39,7 @@ def local_poly_mu_at_t(
     t_val: Tensor,
     a_h: float,
     alpha: float,
+    global_q: float,
 ) -> Tensor:
     t_fixed = t_val.view(1).repeat(X_tr.shape[0]).view(-1, 1)
     with torch.no_grad():
@@ -43,8 +49,11 @@ def local_poly_mu_at_t(
         t0 = t_val.view(())
         diff = T_tr.view(-1) - t0
         dist = torch.abs(diff)
-        dist_q = torch.quantile(dist, 0.1)
-        h_t = float(a_h) * float(dist_q.item() ** float(alpha))
+        dist_q = _nonzero_quantile_1d(dist, 0.1)
+        base = float(dist_q.item() + float(global_q))
+        if base <= 0.0:
+            base = 1e-8
+        h_t = float(a_h) * float(base ** float(alpha))
         if h_t <= 1e-8:
             h_t = 1e-8
         u = diff / h_t
@@ -136,22 +145,77 @@ def get_med(x: Tensor, max_n: int = 500) -> float:
     return float(torch.median(d).item())
 
 
+@torch.no_grad()
+def _nonzero_quantile_1d(x: Tensor, q: float) -> Tensor:
+    x = x.view(-1)
+    x_nz = x[x > 0]
+    if x_nz.numel() == 0:
+        return x.new_tensor(0.0)
+    return torch.quantile(x_nz, q)
+
+
+@torch.no_grad()
+def _nonzero_quantile_cols(dist: Tensor, q: float) -> Tensor:
+    qs = []
+    for j in range(dist.shape[1]):
+        col = dist[:, j]
+        col_nz = col[col > 0]
+        if col_nz.numel() == 0:
+            qs.append(dist.new_tensor(0.0))
+        else:
+            qs.append(torch.quantile(col_nz, q))
+    return torch.stack(qs)
+
+
+@torch.no_grad()
+def _compute_bandwidth_stats(T_train: Tensor, q: float) -> Tuple[Tensor, float]:
+    T_flat = T_train.view(-1, 1)
+    dist = torch.abs(T_flat - T_flat.t())
+    dist_flat = dist.view(-1)
+    dist_nz = dist_flat[dist_flat > 0]
+    if dist_nz.numel() == 0:
+        global_q = 0.0
+    else:
+        global_q = float(torch.quantile(dist_nz, q).item())
+    a_vec = _nonzero_quantile_cols(dist, q)
+    return a_vec, global_q
+
+
 def h0_t(
     T_train: Tensor,
     t: Tensor,
     *,
     a_h: float,
     alpha: float,
+    global_q: float,
+    a_vec: Optional[Tensor] = None,
 ) -> Tensor:
+    if a_vec is not None:
+        base = a_vec + float(global_q)
+        base = torch.clamp(base, min=0.0)
+        h = float(a_h) * (base ** float(alpha))
+        return h.clamp_min(1e-8).view(-1, 1)
+
     T_tr = T_train.view(-1, 1)
     t_q = t.view(1, -1)
     dist = torch.abs(T_tr - t_q)
-    dist_q = torch.quantile(dist, 0.1, dim=0)
-    h = float(a_h) * (dist_q ** float(alpha))
+    dist_q = _nonzero_quantile_cols(dist, 0.1)
+    base = dist_q + float(global_q)
+    base = torch.clamp(base, min=0.0)
+    h = float(a_h) * (base ** float(alpha))
     return h.clamp_min(1e-8).view(-1, 1)
 
 
-def compute_eipm_loss(model: nn.Module, X: Tensor, T: Tensor, a_sigma: float, a_h: float, alpha: float) -> Tensor:
+def compute_eipm_loss(
+    model: nn.Module,
+    X: Tensor,
+    T: Tensor,
+    a_sigma: float,
+    a_h: float,
+    alpha: float,
+    a_vec: Tensor,
+    global_q: float,
+) -> Tensor:
     s_val = model(X, T)
     s_max = torch.max(s_val)
     W_s = torch.exp(s_val - s_max)
@@ -159,7 +223,14 @@ def compute_eipm_loss(model: nn.Module, X: Tensor, T: Tensor, a_sigma: float, a_
     T_flat = T.view(-1, 1)
     dist_sq_T = (T_flat - T_flat.t()) ** 2
 
-    h_T_vec = h0_t(T_train=T, t=T, a_h=float(a_h), alpha=float(alpha))
+    h_T_vec = h0_t(
+        T_train=T,
+        t=T,
+        a_h=float(a_h),
+        alpha=float(alpha),
+        global_q=global_q,
+        a_vec=a_vec,
+    )
     h_T_vec = h_T_vec.view(-1, 1)
     H = (h_T_vec @ h_T_vec.t()).clamp_min(1e-8)
     K_T = torch.exp(-0.5 * dist_sq_T / H)
@@ -177,6 +248,46 @@ def compute_eipm_loss(model: nn.Module, X: Tensor, T: Tensor, a_sigma: float, a_
 
     loss = torch.mean(term1 - term3 + term2)
     return loss
+
+
+@torch.no_grad()
+def compute_h_curve(
+    T_scaled: Tensor,
+    t_grid_scaled: Tensor,
+    a_h: float,
+    alpha: float,
+) -> Tensor:
+    _, global_q = _compute_bandwidth_stats(T_scaled, 0.1)
+    T_flat = T_scaled.view(-1)
+    h_vals = []
+    for t_val in t_grid_scaled.view(-1):
+        dist = torch.abs(T_flat - t_val)
+        dist_q = _nonzero_quantile_1d(dist, 0.1)
+        base = float(dist_q.item() + float(global_q))
+        if base <= 0.0:
+            base = 1e-8
+        h_t = float(a_h) * float(base ** float(alpha))
+        h_vals.append(h_t)
+    return torch.tensor(h_vals, dtype=T_scaled.dtype, device=T_scaled.device)
+
+
+def plot_h_curve(t_grid_raw: np.ndarray, h_raw: np.ndarray, out_path: Path) -> None:
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        raise RuntimeError("matplotlib is required for plotting h(t).") from exc
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.plot(t_grid_raw, h_raw, color="black", linewidth=1.5)
+    ax.set_xlabel("t")
+    ax.set_ylabel("h(t)")
+    ax.grid(True, alpha=0.2)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
 
 
 def objective_cv_mse(
@@ -230,6 +341,7 @@ def objective_cv_mse(
 
         X_tr, T_tr, Y_tr = X_scaled[tr], T_scaled[tr], Y[tr]
         X_va, T_va, Y_va = X_scaled[va], T_scaled[va], Y[va]
+        a_vec_tr, global_q_tr = _compute_bandwidth_stats(T_tr, 0.1)
 
         model = EIPM(input_dim=input_dim, hidden=width, n_layers=depth).to(device)
         opt = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -238,7 +350,7 @@ def objective_cv_mse(
         no_improve = 0
         for it in range(int(max_steps)):
             opt.zero_grad(set_to_none=True)
-            loss = compute_eipm_loss(model, X_tr, T_tr, a_sigma, a_h, alpha)
+            loss = compute_eipm_loss(model, X_tr, T_tr, a_sigma, a_h, alpha, a_vec_tr, global_q_tr)
             if not torch.isfinite(loss):
                 raise RuntimeError(
                     "EIPM loss is not finite: "
@@ -260,6 +372,7 @@ def objective_cv_mse(
                         t_val=T_va[i],
                         a_h=a_h,
                         alpha=alpha,
+                        global_q=global_q_tr,
                     )
                     preds.append(mu_i)
                 pred = torch.stack(preds).view(-1)
@@ -271,8 +384,11 @@ def objective_cv_mse(
                         w_dbg = torch.exp(model(X_tr, t_fixed)).view(-1)
                         diff = T_tr.view(-1) - t_dbg
                         dist = torch.abs(diff)
-                        dist_q = torch.quantile(dist, 0.1)
-                        h_t = float(a_h) * float(dist_q.item() ** float(alpha))
+                        dist_q = _nonzero_quantile_1d(dist, 0.1)
+                        base = float(dist_q.item() + float(global_q_tr))
+                        if base <= 0.0:
+                            base = 1e-8
+                        h_t = float(a_h) * float(base ** float(alpha))
                         if h_t <= 1e-8:
                             h_t = 1e-8
                         k = torch.exp(-0.5 * (diff / h_t) ** 2)
@@ -304,6 +420,7 @@ def objective_cv_mse(
                     t_val=T_va[i],
                     a_h=a_h,
                     alpha=alpha,
+                    global_q=global_q_tr,
                 )
                 preds.append(mu_i)
             pred = torch.stack(preds).view(-1)
@@ -358,6 +475,7 @@ def train_folds_for_params(
 
         X_tr, T_tr, Y_tr = X_scaled[tr], T_scaled[tr], Y[tr]
         X_va, T_va, Y_va = X_scaled[va], T_scaled[va], Y[va]
+        a_vec_tr, global_q_tr = _compute_bandwidth_stats(T_tr, 0.1)
 
         model = EIPM(input_dim=input_dim, hidden=width, n_layers=depth).to(device)
         opt = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -366,7 +484,7 @@ def train_folds_for_params(
         no_improve = 0
         for it in range(int(max_steps)):
             opt.zero_grad(set_to_none=True)
-            loss = compute_eipm_loss(model, X_tr, T_tr, a_sigma, a_h, alpha)
+            loss = compute_eipm_loss(model, X_tr, T_tr, a_sigma, a_h, alpha, a_vec_tr, global_q_tr)
             loss.backward()
             opt.step()
 
@@ -383,6 +501,7 @@ def train_folds_for_params(
                             t_val=T_va[i],
                             a_h=a_h,
                             alpha=alpha,
+                            global_q=global_q_tr,
                         )
                     )
                 pred = torch.stack(preds).view(-1)
@@ -409,6 +528,7 @@ def train_folds_for_params(
                         t_val=T_va[i],
                         a_h=a_h,
                         alpha=alpha,
+                        global_q=global_q_tr,
                     )
                 )
             pred = torch.stack(preds).view(-1)
@@ -482,6 +602,8 @@ def parse_args():
     p.add_argument("--min_delta", type=float, default=1e-8)
 
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--plot_h", action="store_true", help="Save h(t) curve plot per replication.")
+    p.add_argument("--plot_h_n", type=int, default=200, help="Number of grid points for h(t) plot.")
 
     return p.parse_args()
 
@@ -492,20 +614,27 @@ def main():
 
     device = torch.device(args.device)
     out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------
-    # 1. pick fixed dataset (dx5, tk5, ok5)
+    # 1. pick fixed dataset (dx50, tk50, ok50)
     # ------------------------------------------------------------
-    target_name = "sim_nonlinear_dx5_ntr1000_nev10000_rpt100_tk5_ok5_pi0.0_seed42.npz"
+    target_name = "sim_nonlinear_dx50_ntr1000_nev10000_rpt100_tk50_ok50_pi0.0_seed42.npz"
     npz_path = Path(args.data_dir) / target_name
     if not npz_path.exists():
         raise FileNotFoundError(f"Dataset not found: {npz_path}")
+    dataset_tag = Path(npz_path).stem
+    out_dir = out_dir / dataset_tag
+    out_dir.mkdir(parents=True, exist_ok=True)
     print(f"[INFO] Using dataset: {Path(npz_path).name}")
     print(f"[INFO] Dataset path: {Path(npz_path).resolve()}")
+    print(f"[INFO] Checkpoints dir: {out_dir.resolve()}")
 
     reps = load_replications_from_npz(npz_path)
-    reps_to_run = reps[:20]
+    data = np.load(npz_path, allow_pickle=True)
+    T_eval_all = np.array(data["T_eval"]) if "T_eval" in data.files else None
+    reps_to_run = [rep for rep in reps if int(rep.rep_idx) == 45]
+    if len(reps_to_run) == 0:
+        raise RuntimeError("rep_idx=45 not found in dataset.")
     for rep in reps_to_run:
         print(
             f"[INFO] Scenario={rep.scenario}, "
@@ -518,7 +647,8 @@ def main():
         # 2. prepare tensors
         # ------------------------------------------------------------
         X = torch.tensor(rep.X, dtype=torch.float32, device=device)
-        T = torch.tensor(rep.T, dtype=torch.float32, device=device)
+        T_raw = torch.tensor(rep.T, dtype=torch.float32, device=device)
+        T = _transform_t(T_raw)
         Y = torch.tensor(rep.Y, dtype=torch.float32, device=device)
 
         X_std, T_std, x_mean_t, x_std_t, t_mean_t, t_std_t = standardize_train(X, T)
@@ -617,6 +747,31 @@ def main():
             "weight_decay": float(args.fixed_weight_decay),
         }
 
+        if args.plot_h:
+            if T_eval_all is None:
+                print("[WARN] T_eval not found in dataset; skip h(t) plot.")
+            else:
+                if T_eval_all.ndim >= 2:
+                    t_eval_rep = np.array(T_eval_all[int(rep.rep_idx)]).reshape(-1)
+                else:
+                    t_eval_rep = np.array(T_eval_all).reshape(-1)
+                if t_eval_rep.size == 0:
+                    print("[WARN] empty T_eval; skip h(t) plot.")
+                else:
+                    t_min = float(np.min(t_eval_rep))
+                    t_max = float(np.max(t_eval_rep))
+                    n_plot = int(max(10, args.plot_h_n))
+                    t_grid_raw = np.linspace(t_min, t_max, n_plot)
+                    t_grid_scaled = (np.log1p(t_grid_raw) - float(t_mean_t)) / float(t_std_t)
+                    t_grid_scaled_t = torch.tensor(t_grid_scaled, dtype=torch.float32, device=device)
+                    a_h = float(math.exp(best_params["log_a_h"]))
+                    alpha = float(fixed_params["alpha"])
+                    h_scaled = compute_h_curve(T_scaled, t_grid_scaled_t, a_h=a_h, alpha=alpha).detach().cpu().numpy()
+                    h_raw = h_scaled  # h is on transformed+standardized scale
+                    out_path = out_dir / f"h_curve_rep{rep.rep_idx:03d}.png"
+                    plot_h_curve(t_grid_raw, h_raw, out_path)
+                    print(f"[INFO] Saved h(t) plot: {out_path}")
+
         # ------------------------------------------------------------
         # 4. train fold models using best params, then average
         # ------------------------------------------------------------
@@ -669,16 +824,17 @@ def main():
                 "fixed_params": fixed_params,
                 "best_cv_mse": best_cv_mse,
                 "train_stats": train_stats,
-                "standardize": {
-                    "x_mean": x_mean_t.view(-1).detach().cpu().numpy(),
-                    "x_std": x_std_t.view(-1).detach().cpu().numpy(),
-                    "t_mean": float(t_mean_t),
-                    "t_std": float(t_std_t),
+                    "standardize": {
+                        "x_mean": x_mean_t.view(-1).detach().cpu().numpy(),
+                        "x_std": x_std_t.view(-1).detach().cpu().numpy(),
+                        "t_mean": float(t_mean_t),
+                        "t_std": float(t_std_t),
+                    },
+                    "t_transform": _T_TRANSFORM,
+                    "npz_path": npz_path,
+                    "script_args": vars(args),
                 },
-                "npz_path": npz_path,
-                "script_args": vars(args),
-            },
-        )
+            )
 
         print(f"[DONE] Saved checkpoint to {ckpt_path}")
 

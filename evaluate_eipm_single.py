@@ -26,6 +26,30 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _nonzero_quantile(x: np.ndarray, q: float) -> float:
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    x_nz = x[x > 0]
+    if x_nz.size == 0:
+        return 0.0
+    return float(np.quantile(x_nz, q))
+
+
+def _pairwise_nonzero_quantile(T: np.ndarray, q: float) -> float:
+    T = np.asarray(T, dtype=np.float64).reshape(-1)
+    dist = np.abs(T[:, None] - T[None, :]).reshape(-1)
+    dist = dist[dist > 0]
+    if dist.size == 0:
+        return 0.0
+    return float(np.quantile(dist, q))
+
+
+def _apply_t_transform(x: np.ndarray, kind: str) -> np.ndarray:
+    if kind in (None, "identity"):
+        return np.asarray(x, dtype=np.float64)
+    if kind == "log1p":
+        return np.log1p(np.asarray(x, dtype=np.float64))
+    raise ValueError(f"Unknown t_transform: {kind}")
+
 def estimate_adrf_local_poly(
     T_obs: np.ndarray,
     Y_obs: np.ndarray,
@@ -38,13 +62,17 @@ def estimate_adrf_local_poly(
     T_obs = np.asarray(T_obs, dtype=np.float64).reshape(-1)
     Y_obs = np.asarray(Y_obs, dtype=np.float64).reshape(-1)
     log_weights = np.asarray(log_weights, dtype=np.float64).reshape(-1)
+    global_q = _pairwise_nonzero_quantile(T_obs, 0.1)
 
     for t_val in t_grid:
         t0 = float(t_val)
         diff = T_obs - t0
         dist = np.abs(diff)
-        dist_q = np.quantile(dist, 0.1)
-        h_t = float(a_h) * float(dist_q ** float(alpha))
+        dist_q = _nonzero_quantile(dist, 0.1)
+        base = float(dist_q + global_q)
+        if base <= 0.0:
+            base = 1e-8
+        h_t = float(a_h) * float(base ** float(alpha))
         if h_t <= 1e-8:
             h_t = 1e-8
         u = diff / h_t
@@ -77,6 +105,9 @@ def main() -> None:
 
     npz_path = files[0]
     print(f"[INFO] Dataset path: {Path(npz_path).resolve()}")
+    dataset_tag = Path(npz_path).stem
+    ckpt_root = Path(args.ckpt_dir)
+    ckpt_dir = ckpt_root / dataset_tag if (ckpt_root / dataset_tag).exists() else ckpt_root
 
     reps = load_replications_from_npz(npz_path)
     data = np.load(npz_path, allow_pickle=True)
@@ -93,7 +124,7 @@ def main() -> None:
         rep = reps[int(rep_idx)]
         if args.only_rep >= 0 and int(rep.rep_idx) != int(args.only_rep):
             continue
-        ckpt_path = Path(args.ckpt_dir) / f"eipm_single_nonlinear_rep{rep.rep_idx:03d}.pth"
+        ckpt_path = ckpt_dir / f"eipm_single_nonlinear_rep{rep.rep_idx:03d}.pth"
         if not ckpt_path.exists():
             print(f"[WARN] missing checkpoint: {ckpt_path}")
             continue
@@ -111,6 +142,7 @@ def main() -> None:
         if best_params is None:
             raise KeyError(f"best_params not found in checkpoint: {ckpt_path}")
         fixed_params = ckpt.get("fixed_params", {})
+        t_transform = ckpt.get("t_transform", "identity")
         std = ckpt.get("standardize")
         if std is None:
             raise KeyError(f"standardize stats not found in checkpoint: {ckpt_path}")
@@ -134,7 +166,13 @@ def main() -> None:
         model.eval()
 
         X = torch.tensor(rep.X, dtype=torch.float32, device=device)
-        T = torch.tensor(rep.T, dtype=torch.float32, device=device)
+        T_raw = torch.tensor(rep.T, dtype=torch.float32, device=device)
+        if t_transform == "log1p":
+            T = torch.log1p(T_raw)
+        elif t_transform in (None, "identity"):
+            T = T_raw
+        else:
+            raise ValueError(f"Unknown t_transform in checkpoint: {t_transform}")
 
         x_mean = torch.tensor(np.asarray(std["x_mean"]), dtype=torch.float32, device=device).view(1, -1)
         x_std = torch.tensor(np.asarray(std["x_std"]), dtype=torch.float32, device=device).view(1, -1)
@@ -162,11 +200,18 @@ def main() -> None:
         a_h = float(np.exp(best_params["log_a_h"]))
         alpha = float(fixed_params.get("alpha", best_params.get("alpha", 0.05)))
 
+        T_obs_np = _apply_t_transform(rep.T, t_transform)
+        T_eval_np = _apply_t_transform(T_eval, t_transform)
+        t_mean_np = float(std["t_mean"])
+        t_std_np = float(std["t_std"])
+        T_obs_scaled = (T_obs_np.reshape(-1) - t_mean_np) / t_std_np
+        T_eval_scaled = (T_eval_np.reshape(-1) - t_mean_np) / t_std_np
+
         pred = estimate_adrf_local_poly(
-            T_obs=np.asarray(rep.T, dtype=np.float64),
+            T_obs=np.asarray(T_obs_scaled, dtype=np.float64),
             Y_obs=np.asarray(rep.Y, dtype=np.float64),
             log_weights=np.asarray(logw, dtype=np.float64),
-            t_grid=np.asarray(T_eval, dtype=np.float64),
+            t_grid=np.asarray(T_eval_scaled, dtype=np.float64),
             a_h=a_h,
             alpha=alpha,
         )
