@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from device_utils import select_device
 from train_eipm import load_replications_from_npz, EIPM
 
 
@@ -19,7 +20,7 @@ def parse_args() -> argparse.Namespace:
         default="sim_nonlinear_dx5_ntr1000_nev10000_rpt100_tk5_ok5_pi0.0_seed42.npz",
     )
     p.add_argument("--ckpt_dir", type=str, default="./models/eipm_single")
-    p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--device", type=str, default="auto")
     p.add_argument("--eval_n", type=int, default=0)
     p.add_argument("--max_reps", type=int, default=100)
     p.add_argument("--only_rep", type=int, default=-1)
@@ -97,7 +98,7 @@ def estimate_adrf_local_poly(
 
 def main() -> None:
     args = parse_args()
-    device = torch.device(args.device)
+    device = select_device(args.device)
 
     files = sorted(glob.glob(str(Path(args.data_dir) / args.pattern)))
     if not files:

@@ -30,6 +30,7 @@ import torch.optim as optim
 from sklearn.model_selection import KFold, StratifiedKFold
 from torch import Tensor
 
+from device_utils import select_device
 try:
     from zoneinfo import ZoneInfo
     _KST = ZoneInfo("Asia/Seoul")
@@ -952,7 +953,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--data_dir", type=str, default="./datasets")
     p.add_argument("--pattern", type=str, default="sim_*.npz")
     p.add_argument("--out_dir", type=str, default="./models/eipm")
-    p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--device", type=str, default="auto")
 
     # Model / training
     p.add_argument("--depth", type=int, default=2)
@@ -981,7 +982,7 @@ def main() -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    device = torch.device(args.device)
+    device = select_device(args.device)
     files = sorted(glob.glob(str(data_dir / args.pattern)))
 
     if len(files) == 0:

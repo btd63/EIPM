@@ -15,7 +15,7 @@ import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import optuna
@@ -26,11 +26,116 @@ from sklearn.model_selection import KFold, StratifiedKFold
 from torch import Tensor
 
 from device_utils import select_device
-_T_TRANSFORM = "log1p"
+_T_TRANSFORM = "cdf_sigmoid"
 
 
-def _transform_t(T: Tensor) -> Tensor:
-    return torch.log1p(T)
+def _sigmoid(x: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def _logit(u: np.ndarray) -> np.ndarray:
+    return np.log(u / (1.0 - u))
+
+
+def _choose_tail_k(n: int, tail_k: int) -> int:
+    if int(tail_k) > 0:
+        return max(2, min(int(tail_k), n))
+    return max(2, min(int(round(n ** 0.8)), n))
+
+
+def fit_tstar_transform(T_train: np.ndarray, tail_k: int) -> Dict[str, np.ndarray]:
+    T_sorted = np.sort(np.asarray(T_train, dtype=np.float64).reshape(-1))
+    n = int(T_sorted.size)
+    if n < 2:
+        raise ValueError("T_train must have at least 2 samples for T* transform.")
+
+    u_grid = (np.arange(n) + 0.5) / n
+    u0 = float(u_grid[0])
+    u1 = float(u_grid[-1])
+    x0 = float(_logit(np.array(u0)))
+    x1 = float(_logit(np.array(u1)))
+
+    k = _choose_tail_k(n, int(tail_k))
+    eps = 1e-12
+    left_span = max(float(T_sorted[k - 1] - T_sorted[0]), eps)
+    right_span = max(float(T_sorted[-1] - T_sorted[-k]), eps)
+    f_left = float((k - 1) / (n * left_span))
+    f_right = float((k - 1) / (n * right_span))
+    denom_left = max(u0 * (1.0 - u0), eps)
+    denom_right = max(u1 * (1.0 - u1), eps)
+    s_left = float(f_left / denom_left)
+    s_right = float(f_right / denom_right)
+
+    return {
+        "T_sorted": T_sorted,
+        "u_grid": u_grid,
+        "u0": np.array(u0, dtype=np.float64),
+        "u1": np.array(u1, dtype=np.float64),
+        "x0": np.array(x0, dtype=np.float64),
+        "x1": np.array(x1, dtype=np.float64),
+        "s_left": np.array(s_left, dtype=np.float64),
+        "s_right": np.array(s_right, dtype=np.float64),
+        "k_tail": np.array(k, dtype=np.int64),
+    }
+
+
+def transform_t_to_star(t: np.ndarray, params: Dict[str, np.ndarray]) -> np.ndarray:
+    t = np.asarray(t, dtype=np.float64)
+    T_sorted = params["T_sorted"]
+    u_grid = params["u_grid"]
+    Tmin = float(T_sorted[0])
+    Tmax = float(T_sorted[-1])
+    u0 = float(params["u0"])
+    u1 = float(params["u1"])
+    x0 = float(params["x0"])
+    x1 = float(params["x1"])
+    s_left = float(params["s_left"])
+    s_right = float(params["s_right"])
+
+    u = np.empty_like(t, dtype=np.float64)
+    mask_mid = (t >= Tmin) & (t <= Tmax)
+    if np.any(mask_mid):
+        u[mask_mid] = np.interp(t[mask_mid], T_sorted, u_grid)
+    mask_left = t < Tmin
+    if np.any(mask_left):
+        u[mask_left] = _sigmoid(x0 + (t[mask_left] - Tmin) * s_left)
+    mask_right = t > Tmax
+    if np.any(mask_right):
+        u[mask_right] = _sigmoid(x1 + (t[mask_right] - Tmax) * s_right)
+
+    eps = 1e-8
+    u = np.clip(u, eps, 1.0 - eps)
+    return 2.0 * u - 1.0
+
+
+def transform_star_to_t(t_star: np.ndarray, params: Dict[str, np.ndarray]) -> np.ndarray:
+    t_star = np.asarray(t_star, dtype=np.float64)
+    T_sorted = params["T_sorted"]
+    u_grid = params["u_grid"]
+    Tmin = float(T_sorted[0])
+    Tmax = float(T_sorted[-1])
+    u0 = float(params["u0"])
+    u1 = float(params["u1"])
+    x0 = float(params["x0"])
+    x1 = float(params["x1"])
+    s_left = float(params["s_left"])
+    s_right = float(params["s_right"])
+
+    u = (t_star + 1.0) * 0.5
+    eps = 1e-8
+    u = np.clip(u, eps, 1.0 - eps)
+
+    t = np.empty_like(u, dtype=np.float64)
+    mask_mid = (u >= u0) & (u <= u1)
+    if np.any(mask_mid):
+        t[mask_mid] = np.interp(u[mask_mid], u_grid, T_sorted)
+    mask_left = u < u0
+    if np.any(mask_left):
+        t[mask_left] = Tmin + (_logit(u[mask_left]) - x0) / max(s_left, eps)
+    mask_right = u > u1
+    if np.any(mask_right):
+        t[mask_right] = Tmax + (_logit(u[mask_right]) - x1) / max(s_right, eps)
+    return t
 
 def local_poly_mu_at_t(
     X_tr: Tensor,
@@ -39,8 +144,7 @@ def local_poly_mu_at_t(
     model: nn.Module,
     t_val: Tensor,
     a_h: float,
-    alpha: float,
-    global_q: float,
+    nn: float,
 ) -> Tensor:
     t_fixed = t_val.view(1).repeat(X_tr.shape[0]).view(-1, 1)
     with torch.no_grad():
@@ -49,12 +153,8 @@ def local_poly_mu_at_t(
     with torch.no_grad():
         t0 = t_val.view(())
         diff = T_tr.view(-1) - t0
-        dist = torch.abs(diff)
-        dist_q = _nonzero_quantile_1d(dist, 0.1)
-        base = float(dist_q.item() + float(global_q))
-        if base <= 0.0:
-            base = 1e-8
-        h_t = float(a_h) * float(base ** float(alpha))
+        h_knn = _knn_bandwidth(T_tr.view(-1), t_val.view(1), nn=float(nn))[0]
+        h_t = float(a_h) * float(h_knn.item())
         if h_t <= 1e-8:
             h_t = 1e-8
         u = diff / h_t
@@ -147,39 +247,17 @@ def get_med(x: Tensor, max_n: int = 500) -> float:
 
 
 @torch.no_grad()
-def _nonzero_quantile_1d(x: Tensor, q: float) -> Tensor:
-    x = x.view(-1)
-    x_nz = x[x > 0]
-    if x_nz.numel() == 0:
-        return x.new_tensor(0.0)
-    return torch.quantile(x_nz, q)
-
-
-@torch.no_grad()
-def _nonzero_quantile_cols(dist: Tensor, q: float) -> Tensor:
-    qs = []
-    for j in range(dist.shape[1]):
-        col = dist[:, j]
-        col_nz = col[col > 0]
-        if col_nz.numel() == 0:
-            qs.append(dist.new_tensor(0.0))
-        else:
-            qs.append(torch.quantile(col_nz, q))
-    return torch.stack(qs)
-
-
-@torch.no_grad()
-def _compute_bandwidth_stats(T_train: Tensor, q: float) -> Tuple[Tensor, float]:
-    T_flat = T_train.view(-1, 1)
-    dist = torch.abs(T_flat - T_flat.t())
-    dist_flat = dist.view(-1)
-    dist_nz = dist_flat[dist_flat > 0]
-    if dist_nz.numel() == 0:
-        global_q = 0.0
-    else:
-        global_q = float(torch.quantile(dist_nz, q).item())
-    a_vec = _nonzero_quantile_cols(dist, q)
-    return a_vec, global_q
+def _knn_bandwidth(T_train: Tensor, t: Tensor, nn: float) -> Tensor:
+    T_train = T_train.view(-1)
+    t = t.view(-1)
+    n = int(T_train.numel())
+    if n == 0:
+        return t.new_full(t.shape, 1e-8)
+    k = int(math.ceil(float(nn) * float(n)))
+    k = max(2, min(k, n))
+    dist = torch.abs(T_train.view(-1, 1) - t.view(1, -1))
+    h, _ = torch.kthvalue(dist, k, dim=0)
+    return h.clamp_min(1e-8)
 
 
 def h0_t(
@@ -187,23 +265,10 @@ def h0_t(
     t: Tensor,
     *,
     a_h: float,
-    alpha: float,
-    global_q: float,
-    a_vec: Optional[Tensor] = None,
+    nn: float,
 ) -> Tensor:
-    if a_vec is not None:
-        base = a_vec + float(global_q)
-        base = torch.clamp(base, min=0.0)
-        h = float(a_h) * (base ** float(alpha))
-        return h.clamp_min(1e-8).view(-1, 1)
-
-    T_tr = T_train.view(-1, 1)
-    t_q = t.view(1, -1)
-    dist = torch.abs(T_tr - t_q)
-    dist_q = _nonzero_quantile_cols(dist, 0.1)
-    base = dist_q + float(global_q)
-    base = torch.clamp(base, min=0.0)
-    h = float(a_h) * (base ** float(alpha))
+    h_knn = _knn_bandwidth(T_train, t, nn=float(nn))
+    h = float(a_h) * h_knn
     return h.clamp_min(1e-8).view(-1, 1)
 
 
@@ -213,9 +278,7 @@ def compute_eipm_loss(
     T: Tensor,
     a_sigma: float,
     a_h: float,
-    alpha: float,
-    a_vec: Tensor,
-    global_q: float,
+    nn: float,
 ) -> Tensor:
     s_val = model(X, T)
     s_max = torch.max(s_val)
@@ -228,9 +291,7 @@ def compute_eipm_loss(
         T_train=T,
         t=T,
         a_h=float(a_h),
-        alpha=float(alpha),
-        global_q=global_q,
-        a_vec=a_vec,
+        nn=float(nn),
     )
     h_T_vec = h_T_vec.view(-1, 1)
     H = (h_T_vec @ h_T_vec.t()).clamp_min(1e-8)
@@ -256,20 +317,10 @@ def compute_h_curve(
     T_scaled: Tensor,
     t_grid_scaled: Tensor,
     a_h: float,
-    alpha: float,
+    nn: float,
 ) -> Tensor:
-    _, global_q = _compute_bandwidth_stats(T_scaled, 0.1)
-    T_flat = T_scaled.view(-1)
-    h_vals = []
-    for t_val in t_grid_scaled.view(-1):
-        dist = torch.abs(T_flat - t_val)
-        dist_q = _nonzero_quantile_1d(dist, 0.1)
-        base = float(dist_q.item() + float(global_q))
-        if base <= 0.0:
-            base = 1e-8
-        h_t = float(a_h) * float(base ** float(alpha))
-        h_vals.append(h_t)
-    return torch.tensor(h_vals, dtype=T_scaled.dtype, device=T_scaled.device)
+    h_vals = h0_t(T_train=T_scaled, t=t_grid_scaled, a_h=a_h, nn=nn).view(-1)
+    return h_vals
 
 
 def plot_h_curve(t_grid_raw: np.ndarray, h_raw: np.ndarray, out_path: Path) -> None:
@@ -305,22 +356,20 @@ def objective_cv_mse(
     min_delta: float = 1e-3,
     n_splits: int = 5,
     seed: int = 42,
-    log_a_h_low: float = -1.0,
-    log_a_h_high: float = 1.0,
     eval_every: int = 10,
-    fixed_alpha: float = 0.05,
     fixed_lr: float = 0.003,
     fixed_weight_decay: float = 1.0e-6,
+    fixed_nn: float = 0.7,
 ) -> float:
     log_a_sigma = trial.suggest_float("log_a_sigma", -2.0, 2.0)
-    log_a_h = trial.suggest_float("log_a_h", float(log_a_h_low), float(log_a_h_high))
+    log_a_h = trial.suggest_float("log_a_h", -1.0, 1.0)
 
     a_sigma = math.exp(float(log_a_sigma))
     a_h = math.exp(float(log_a_h))
 
-    alpha = float(fixed_alpha)
     lr = float(fixed_lr)
     weight_decay = float(fixed_weight_decay)
+    nn_val = float(fixed_nn)
 
     with torch.no_grad():
         y_strat = (T_scaled.detach().cpu().numpy() == 0.0).astype(int)
@@ -342,8 +391,6 @@ def objective_cv_mse(
 
         X_tr, T_tr, Y_tr = X_scaled[tr], T_scaled[tr], Y[tr]
         X_va, T_va, Y_va = X_scaled[va], T_scaled[va], Y[va]
-        a_vec_tr, global_q_tr = _compute_bandwidth_stats(T_tr, 0.1)
-
         model = EIPM(input_dim=input_dim, hidden=width, n_layers=depth).to(device)
         opt = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
@@ -351,12 +398,12 @@ def objective_cv_mse(
         no_improve = 0
         for it in range(int(max_steps)):
             opt.zero_grad(set_to_none=True)
-            loss = compute_eipm_loss(model, X_tr, T_tr, a_sigma, a_h, alpha, a_vec_tr, global_q_tr)
+            loss = compute_eipm_loss(model, X_tr, T_tr, a_sigma, a_h, nn_val)
             if not torch.isfinite(loss):
                 raise RuntimeError(
                     "EIPM loss is not finite: "
                     f"trial={getattr(trial, 'number', 'NA')} it={it} "
-                    f"a_sigma={a_sigma:.3g} a_h={a_h:.3g} alpha={alpha:.3g} "
+                    f"a_sigma={a_sigma:.3g} a_h={a_h:.3g} "
                     f"lr={lr:.3g} wd={weight_decay:.3g} "
                 )
             loss.backward()
@@ -372,8 +419,7 @@ def objective_cv_mse(
                         Y_tr=Y_tr,
                         t_val=T_va[i],
                         a_h=a_h,
-                        alpha=alpha,
-                        global_q=global_q_tr,
+                        nn=nn_val,
                     )
                     preds.append(mu_i)
                 pred = torch.stack(preds).view(-1)
@@ -384,12 +430,8 @@ def objective_cv_mse(
                         t_fixed = t_dbg.view(1).repeat(X_tr.shape[0]).view(-1, 1)
                         w_dbg = torch.exp(model(X_tr, t_fixed)).view(-1)
                         diff = T_tr.view(-1) - t_dbg
-                        dist = torch.abs(diff)
-                        dist_q = _nonzero_quantile_1d(dist, 0.1)
-                        base = float(dist_q.item() + float(global_q_tr))
-                        if base <= 0.0:
-                            base = 1e-8
-                        h_t = float(a_h) * float(base ** float(alpha))
+                        h_knn = _knn_bandwidth(T_tr.view(-1), t_dbg.view(1), nn=nn_val)[0]
+                        h_t = float(a_h) * float(h_knn.item())
                         if h_t <= 1e-8:
                             h_t = 1e-8
                         k = torch.exp(-0.5 * (diff / h_t) ** 2)
@@ -420,8 +462,7 @@ def objective_cv_mse(
                     Y_tr=Y_tr,
                     t_val=T_va[i],
                     a_h=a_h,
-                    alpha=alpha,
-                    global_q=global_q_tr,
+                    nn=nn_val,
                 )
                 preds.append(mu_i)
             pred = torch.stack(preds).view(-1)
@@ -451,7 +492,7 @@ def train_folds_for_params(
 ) -> Tuple[List[Dict[str, Tensor]], List[float]]:
     a_sigma = math.exp(float(params["log_a_sigma"]))
     a_h = math.exp(float(params["log_a_h"]))
-    alpha = float(params["alpha"])
+    nn_val = float(params["nn"])
     lr = float(params["lr"])
     weight_decay = float(params["weight_decay"])
 
@@ -476,8 +517,6 @@ def train_folds_for_params(
 
         X_tr, T_tr, Y_tr = X_scaled[tr], T_scaled[tr], Y[tr]
         X_va, T_va, Y_va = X_scaled[va], T_scaled[va], Y[va]
-        a_vec_tr, global_q_tr = _compute_bandwidth_stats(T_tr, 0.1)
-
         model = EIPM(input_dim=input_dim, hidden=width, n_layers=depth).to(device)
         opt = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
@@ -485,7 +524,7 @@ def train_folds_for_params(
         no_improve = 0
         for it in range(int(max_steps)):
             opt.zero_grad(set_to_none=True)
-            loss = compute_eipm_loss(model, X_tr, T_tr, a_sigma, a_h, alpha, a_vec_tr, global_q_tr)
+            loss = compute_eipm_loss(model, X_tr, T_tr, a_sigma, a_h, nn_val)
             loss.backward()
             opt.step()
 
@@ -501,8 +540,7 @@ def train_folds_for_params(
                             Y_tr=Y_tr,
                             t_val=T_va[i],
                             a_h=a_h,
-                            alpha=alpha,
-                            global_q=global_q_tr,
+                            nn=nn_val,
                         )
                     )
                 pred = torch.stack(preds).view(-1)
@@ -524,14 +562,13 @@ def train_folds_for_params(
                     local_poly_mu_at_t(
                         model=model,
                         X_tr=X_tr,
-                        T_tr=T_tr,
-                        Y_tr=Y_tr,
-                        t_val=T_va[i],
-                        a_h=a_h,
-                        alpha=alpha,
-                        global_q=global_q_tr,
-                    )
+                    T_tr=T_tr,
+                    Y_tr=Y_tr,
+                    t_val=T_va[i],
+                    a_h=a_h,
+                    nn=nn_val,
                 )
+            )
             pred = torch.stack(preds).view(-1)
             best_mse = float(torch.mean((pred - Y_va.view(-1)) ** 2).item())
 
@@ -582,7 +619,7 @@ def parse_args():
     p = argparse.ArgumentParser()
 
     p.add_argument("--data_dir", type=str, default="./datasets")
-    p.add_argument("--out_dir", type=str, default="./models/eipm_single")
+    p.add_argument("--out_dir", type=str, default="./models/eipm_single_v3")
     p.add_argument("--device", type=str, default="auto")
 
     # model / training
@@ -596,11 +633,15 @@ def parse_args():
     p.add_argument("--k_folds", type=int, default=5)
     p.add_argument("--max_steps", type=int, default=300)
     p.add_argument("--eval_every", type=int, default=30)
-    p.add_argument("--fixed_alpha", type=float, default=0.05)
     p.add_argument("--fixed_lr", type=float, default=0.003)
     p.add_argument("--fixed_weight_decay", type=float, default=1.0e-6)
+    p.add_argument("--nn", type=float, default=0.7, help="Nearest-neighbor fraction for bandwidth (0,1].")
+    p.add_argument("--tail_k", type=int, default=0, help="Tail k for CDF-sigmoid transform (0 => n**0.8).")
     p.add_argument("--patience", type=int, default=3)
     p.add_argument("--min_delta", type=float, default=1e-8)
+
+    p.add_argument("--max_reps", type=int, default=100, help="Maximum number of reps to train (in order).")
+    p.add_argument("--only_rep", type=int, default=-1, help="Train only this replication index.")
 
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--plot_h", action="store_true", help="Save h(t) curve plot per replication.")
@@ -633,9 +674,13 @@ def main():
     reps = load_replications_from_npz(npz_path)
     data = np.load(npz_path, allow_pickle=True)
     T_eval_all = np.array(data["T_eval"]) if "T_eval" in data.files else None
-    reps_to_run = [rep for rep in reps if int(rep.rep_idx) == 45]
-    if len(reps_to_run) == 0:
-        raise RuntimeError("rep_idx=45 not found in dataset.")
+    if args.only_rep >= 0:
+        reps_to_run = [rep for rep in reps if int(rep.rep_idx) == int(args.only_rep)]
+        if len(reps_to_run) == 0:
+            raise RuntimeError(f"rep_idx={args.only_rep} not found in dataset.")
+    else:
+        n_run = min(int(args.max_reps), len(reps))
+        reps_to_run = reps[:n_run]
     for rep in reps_to_run:
         print(
             f"[INFO] Scenario={rep.scenario}, "
@@ -648,8 +693,9 @@ def main():
         # 2. prepare tensors
         # ------------------------------------------------------------
         X = torch.tensor(rep.X, dtype=torch.float32, device=device)
-        T_raw = torch.tensor(rep.T, dtype=torch.float32, device=device)
-        T = _transform_t(T_raw)
+        tstar_params = fit_tstar_transform(rep.T, tail_k=int(args.tail_k))
+        T_star = transform_t_to_star(rep.T, tstar_params)
+        T = torch.tensor(T_star, dtype=torch.float32, device=device)
         Y = torch.tensor(rep.Y, dtype=torch.float32, device=device)
 
         X_std, T_std, x_mean_t, x_std_t, t_mean_t, t_std_t = standardize_train(X, T)
@@ -659,80 +705,37 @@ def main():
         input_dim = int(rep.d_X) + 1
 
         # ------------------------------------------------------------
-        # 3. hyperparameter tuning (auto range expansion)
+        # 3. hyperparameter tuning (only a_sigma)
         # ------------------------------------------------------------
-        def _boundary_tol(n_trials: int, width: float) -> float:
-            rel = max(0.05, 1.0 / (2.0 * math.sqrt(max(1, int(n_trials)))))
-            return rel * float(width)
-
         print("[INFO] Start hyperparameter tuning...")
-        log_a_h_low = -1.0
-        log_a_h_high = 1.0
-        expand_factor = 4.0
-        max_expand = 5
-
-        best_params = None
-        best_cv_mse = float("inf")
-        best_trial = -1
-
-        for expand_i in range(max_expand + 1):
-            def _obj_local(trial, low=log_a_h_low, high=log_a_h_high):
-                return objective_cv_mse(
-                    trial=trial,
-                    X_scaled=X_scaled,
-                    T_scaled=T_scaled,
-                    Y=Y,
-                    input_dim=input_dim,
-                    device=device,
-                    depth=args.depth,
-                    width=args.width,
-                    max_steps=args.max_steps,
-                    patience=args.patience,
-                    min_delta=args.min_delta,
-                    n_splits=args.k_folds,
-                    seed=args.seed,
-                    log_a_h_low=low,
-                    log_a_h_high=high,
-                    eval_every=args.eval_every,
-                    fixed_alpha=args.fixed_alpha,
-                    fixed_lr=args.fixed_lr,
-                    fixed_weight_decay=args.fixed_weight_decay,
-                )
-
-            sampler = optuna.samplers.TPESampler(seed=int(args.seed), n_startup_trials=int(args.n_startup_trials))
-            study = optuna.create_study(direction="minimize", sampler=sampler)
-            study.optimize(_obj_local, n_trials=args.n_trials, show_progress_bar=True)
-
-            if float(study.best_value) < float(best_cv_mse):
-                best_params = study.best_params
-                best_cv_mse = float(study.best_value)
-                best_trial = int(study.best_trial.number)
-
-            best_log = float(study.best_params["log_a_h"])
-            width = log_a_h_high - log_a_h_low
-            tol = _boundary_tol(int(args.n_trials), width)
-            at_low = best_log <= (log_a_h_low + tol)
-            at_high = best_log >= (log_a_h_high - tol)
-            if not (at_low or at_high):
-                break
-            if expand_i == max_expand:
-                break
-            width = log_a_h_high - log_a_h_low
-            center = (log_a_h_low + log_a_h_high) * 0.5
-            new_half = 0.5 * float(expand_factor) * width
-            if at_high and not at_low:
-                log_a_h_low = center
-                log_a_h_high = center + new_half
-            elif at_low and not at_high:
-                log_a_h_low = center - new_half
-                log_a_h_high = center
-            else:
-                log_a_h_low = center - new_half
-                log_a_h_high = center + new_half
-            print(
-                f"[TUNE] expand log_a_h to [{log_a_h_low:.3g}, {log_a_h_high:.3g}] "
-                f"(best_log={best_log:.3g}, tol={tol:.3g})"
+        def _obj_local(trial):
+            return objective_cv_mse(
+                trial=trial,
+                X_scaled=X_scaled,
+                T_scaled=T_scaled,
+                Y=Y,
+                input_dim=input_dim,
+                device=device,
+                depth=args.depth,
+                width=args.width,
+                max_steps=args.max_steps,
+                patience=args.patience,
+                min_delta=args.min_delta,
+                n_splits=args.k_folds,
+                seed=args.seed,
+                eval_every=args.eval_every,
+                fixed_lr=args.fixed_lr,
+                fixed_weight_decay=args.fixed_weight_decay,
+                fixed_nn=args.nn,
             )
+
+        sampler = optuna.samplers.TPESampler(seed=int(args.seed), n_startup_trials=int(args.n_startup_trials))
+        study = optuna.create_study(direction="minimize", sampler=sampler)
+        study.optimize(_obj_local, n_trials=args.n_trials, show_progress_bar=True)
+
+        best_params = study.best_params
+        best_cv_mse = float(study.best_value)
+        best_trial = int(study.best_trial.number)
 
         print("[INFO] Best CV MSE:", best_cv_mse)
         print(
@@ -743,9 +746,9 @@ def main():
             },
         )
         fixed_params = {
-            "alpha": float(args.fixed_alpha),
             "lr": float(args.fixed_lr),
             "weight_decay": float(args.fixed_weight_decay),
+            "nn": float(args.nn),
         }
 
         if args.plot_h:
@@ -763,11 +766,15 @@ def main():
                     t_max = float(np.max(t_eval_rep))
                     n_plot = int(max(10, args.plot_h_n))
                     t_grid_raw = np.linspace(t_min, t_max, n_plot)
-                    t_grid_scaled = (np.log1p(t_grid_raw) - float(t_mean_t)) / float(t_std_t)
+                    t_grid_star = transform_t_to_star(t_grid_raw, tstar_params)
+                    t_grid_scaled = (t_grid_star - float(t_mean_t)) / float(t_std_t)
                     t_grid_scaled_t = torch.tensor(t_grid_scaled, dtype=torch.float32, device=device)
-                    a_h = float(math.exp(best_params["log_a_h"]))
-                    alpha = float(fixed_params["alpha"])
-                    h_scaled = compute_h_curve(T_scaled, t_grid_scaled_t, a_h=a_h, alpha=alpha).detach().cpu().numpy()
+                    h_scaled = compute_h_curve(
+                        T_scaled,
+                        t_grid_scaled_t,
+                        a_h=float(math.exp(best_params["log_a_h"])),
+                        nn=float(fixed_params["nn"]),
+                    ).detach().cpu().numpy()
                     h_raw = h_scaled  # h is on transformed+standardized scale
                     out_path = out_dir / f"h_curve_rep{rep.rep_idx:03d}.png"
                     plot_h_curve(t_grid_raw, h_raw, out_path)
@@ -832,6 +839,8 @@ def main():
                         "t_std": float(t_std_t),
                     },
                     "t_transform": _T_TRANSFORM,
+                    "tstar_params": tstar_params,
+                    "bandwidth": {"type": "knn", "nn": float(args.nn)},
                     "npz_path": npz_path,
                     "script_args": vars(args),
                 },
