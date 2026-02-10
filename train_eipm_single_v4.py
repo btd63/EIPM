@@ -606,6 +606,12 @@ def parse_args():
     p = argparse.ArgumentParser()
 
     p.add_argument("--data_dir", type=str, default="./datasets")
+    p.add_argument(
+        "--pattern",
+        type=str,
+        default="sim_nonlinear_dx50_ntr1000_nev10000_rpt100_tk50_ok50_pi0.0_seed42.npz",
+        help="Dataset filename under data_dir.",
+    )
     p.add_argument("--out_dir", type=str, default="./models/eipm_single_v4")
     p.add_argument("--device", type=str, default="auto")
 
@@ -645,9 +651,9 @@ def main():
     out_dir = Path(args.out_dir)
 
     # ------------------------------------------------------------
-    # 1. pick fixed dataset (dx50, tk50, ok50)
+    # 1. pick dataset
     # ------------------------------------------------------------
-    target_name = "sim_nonlinear_dx50_ntr1000_nev10000_rpt100_tk50_ok50_pi0.0_seed42.npz"
+    target_name = args.pattern
     npz_path = Path(args.data_dir) / target_name
     if not npz_path.exists():
         raise FileNotFoundError(f"Dataset not found: {npz_path}")

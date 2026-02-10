@@ -135,6 +135,7 @@ def main() -> None:
 
     mse_list = []
     mae_list = []
+    bias_list = []
 
     print(f"[INFO] Dataset: {npz_path.name}")
     print(f"[INFO] Using huling_dir: {huling_dir}")
@@ -184,17 +185,21 @@ def main() -> None:
             for t_val, p_val, m_val in zip(t_s, p_s, m_s):
                 print(f"{float(t_val):.6g}, {float(p_val):.6g}, {float(m_val):.6g}")
 
-        mse = torch.mean((pred_t[valid] - mu_eval_t[valid]) ** 2).item()
-        mae = torch.mean(torch.abs(pred_t[valid] - mu_eval_t[valid])).item()
+        diff = pred_t[valid] - mu_eval_t[valid]
+        mse = torch.mean(diff ** 2).item()
+        mae = torch.mean(torch.abs(diff)).item()
+        bias = torch.mean(diff).item()
 
         mse_list.append(mse)
         mae_list.append(mae)
+        bias_list.append(bias)
 
-        print(f"[HULING] rep={r:03d} MSE={mse:.6g} MAE={mae:.6g}")
+        print(f"[HULING] rep={r:03d} MSE={mse:.6g} MAE={mae:.6g} BIAS={bias:.6g}")
 
     mse_rms = float(np.sqrt(np.mean(np.square(np.array(mse_list))))) if mse_list else float("nan")
     mae_mean = float(np.mean(mae_list)) if mae_list else float("nan")
-    print(f"[SUMMARY] MSE_mean={mse_rms:.6g} MAE_mean={mae_mean:.6g}")
+    bias_mean = float(np.mean(bias_list)) if bias_list else float("nan")
+    print(f"[SUMMARY] MSE_mean={mse_rms:.6g} MAE_mean={mae_mean:.6g} BIAS_mean={bias_mean:.6g}")
 
 
 if __name__ == "__main__":

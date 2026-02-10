@@ -437,3 +437,33 @@ weighted_energy_stats <- function(A, X, weights,
   return(retobj)
 }
 
+# ------------------------------------------------------------
+# If run as a script, compute weights for ./rep000.csv
+# and save ./rep000_weights.csv in the current working directory.
+# This block is skipped when the file is sourced by other scripts.
+# ------------------------------------------------------------
+run_rep000_weights <- function(csv_path = "E:/Dropbox/PC (2)/Downloads/260105/sim_huling_ntr1000_nev500_rpt100_mx1-0.5_mx21.0_mx30.3_ae1_seed42/rep000.csv",
+                               out_path = "E:/Dropbox/PC (2)/Downloads/260105/sim_huling_ntr1000_nev500_rpt100_mx1-0.5_mx21.0_mx30.3_ae1_seed42/rep000_weights.csv")
+{
+  if (!file.exists(csv_path)) {
+    stop(sprintf("File not found: %s (current dir: %s)", csv_path, getwd()))
+  }
+  dat <- read.csv(csv_path, header = TRUE)
+  if (!all(c("T", "Y") %in% names(dat))) {
+    stop("CSV must include columns named T and Y.")
+  }
+  A <- dat[["T"]]
+  X <- as.matrix(dat[, setdiff(names(dat), c("T", "Y")), drop = FALSE])
+  fit <- independence_weights(A, X)
+  write.csv(data.frame(weight = fit$weights), out_path, row.names = FALSE)
+  cat(sprintf("[DONE] saved %s\n", out_path))
+}
+
+if (sys.nframe() == 0) {
+  if (!requireNamespace("osqp", quietly = TRUE)) {
+    stop("Package 'osqp' is required. Install with install.packages('osqp').")
+  }
+  # ensure solve_osqp is available (independence_weights uses it unqualified)
+  solve_osqp <- osqp::solve_osqp
+  run_rep000_weights()
+}

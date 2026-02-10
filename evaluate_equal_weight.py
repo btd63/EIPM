@@ -19,6 +19,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ckpt_dir", type=str, default="./models/eipm_single_v5")
     p.add_argument("--out_dir", type=str, default="./models/equal_weight")
     p.add_argument("--device", type=str, default="auto")
+    p.add_argument("--degree", type=int, choices=[0, 1], default=1, help="Local polynomial degree (0=constant, 1=linear).")
+    p.add_argument("--nn", type=float, default=0.7, help="Nearest-neighbor fraction for bandwidth (0,1].")
+    p.add_argument("--t_transform", type=str, choices=["identity", "log1p"], default="identity")
     p.add_argument("--eval_n", type=int, default=0)
     p.add_argument("--max_reps", type=int, default=100)
     p.add_argument("--organize_ckpts", action="store_true", help="Move mixed checkpoints into dataset subfolders.")
@@ -213,6 +216,63 @@ def estimate_adrf_local_poly_knn(
         preds.append(float(np.sum(w_eff * Y_obs)))
 
     return np.array(preds, dtype=np.float64)
+
+
+def estimate_adrf_huling_local_poly(
+    T_obs: np.ndarray,
+    Y_obs: np.ndarray,
+    weights: np.ndarray,
+    t_grid: np.ndarray,
+    *,
+    degree: int = 1,
+    nn: float = 0.7,
+    t_transform: str = "identity",
+) -> np.ndarray:
+    """
+    Huling-style local polynomial with adaptive kNN bandwidth.
+    """
+    T_raw = np.asarray(T_obs, dtype=np.float64).reshape(-1)
+    Y = np.asarray(Y_obs, dtype=np.float64).reshape(-1)
+    w_base = np.asarray(weights, dtype=np.float64).reshape(-1)
+    t_grid_raw = np.asarray(t_grid, dtype=np.float64).reshape(-1)
+
+    if T_raw.shape[0] != Y.shape[0] or T_raw.shape[0] != w_base.shape[0]:
+        raise ValueError("T_obs, Y_obs, weights must have the same length.")
+
+    if np.all(w_base == 0.0) or (np.mean(w_base == 0.0) > 0.95):
+        return np.full_like(t_grid_raw, fill_value=np.nan, dtype=np.float64)
+
+    if not (0.0 < float(nn) <= 1.0):
+        raise ValueError("--nn must be in (0,1].")
+
+    T = _apply_t_transform(T_raw, t_transform)
+    t_grid_t = _apply_t_transform(t_grid_raw, t_transform)
+
+    n = int(T.shape[0])
+    k = int(np.ceil(float(nn) * n))
+    k = max(2, min(k, n))
+
+    diff = (T[:, None] - t_grid_t[None, :]).astype(np.float64)
+    dist = np.abs(diff)
+    h = np.partition(dist, kth=k - 1, axis=0)[k - 1, :]
+    h = np.maximum(h, 1e-8)
+
+    u = diff / h[None, :]
+    K = np.exp(-0.5 * (u ** 2))
+    W = (w_base[:, None] * K).astype(np.float64)
+
+    if int(degree) == 0:
+        num = np.sum(W * Y[:, None], axis=0)
+        den = np.sum(W, axis=0)
+        return num / (den + 1e-12)
+
+    S0 = np.sum(W, axis=0)
+    S1 = np.sum(W * diff, axis=0)
+    S2 = np.sum(W * diff * diff, axis=0)
+    T0 = np.sum(W * Y[:, None], axis=0)
+    T1 = np.sum(W * diff * Y[:, None], axis=0)
+    denom = S0 * S2 - S1 * S1
+    return (S2 * T0 - S1 * T1) / (denom + 1e-12)
 
 
 def _h_curve(
@@ -448,14 +508,9 @@ def main() -> None:
         std = ckpt.get("standardize")
         if std is None:
             raise KeyError(f"standardize stats not found in checkpoint: {ckpt_path}")
-        t_transform = ckpt.get("t_transform", "identity")
-        tstar_params = ckpt.get("tstar_params") if t_transform == "cdf_sigmoid" else None
-        bandwidth = ckpt.get("bandwidth", {})
-        h_type = str(bandwidth.get("type", "quantile"))
-        if h_type == "knn":
-            nn_val = float(bandwidth.get("nn", fixed_params.get("nn", 0.7)))
-        else:
-            nn_val = None
+        t_transform = str(args.t_transform)
+        nn_val = float(args.nn)
+        degree = int(args.degree)
 
         # No model usage for equal weights; keep script_args parsing only if needed later.
 
@@ -465,30 +520,7 @@ def main() -> None:
             print(f"[WARN] ckpt input_dim mismatch: {ckpt_in} != {expected_in}")
             continue
 
-        X = torch.tensor(rep.X, dtype=torch.float32, device=device)
-        T_raw = torch.tensor(rep.T, dtype=torch.float32, device=device)
-        if t_transform == "cdf_sigmoid":
-            if tstar_params is None:
-                raise KeyError("tstar_params missing for cdf_sigmoid transform.")
-            T_star = transform_t_to_star(rep.T, tstar_params)
-            T = torch.tensor(T_star, dtype=torch.float32, device=device)
-        elif t_transform == "log1p":
-            T = torch.log1p(T_raw)
-        elif t_transform in (None, "identity"):
-            T = T_raw
-        else:
-            raise ValueError(f"Unknown t_transform in checkpoint: {t_transform}")
-
-        x_mean = torch.tensor(np.asarray(std["x_mean"]), dtype=torch.float32, device=device).view(1, -1)
-        x_std = torch.tensor(np.asarray(std["x_std"]), dtype=torch.float32, device=device).view(1, -1)
-        t_mean = torch.tensor(float(std["t_mean"]), dtype=torch.float32, device=device)
-        t_std = torch.tensor(float(std["t_std"]), dtype=torch.float32, device=device)
-
-        X_std = (X - x_mean) / x_std
-        X_scaled = X_std / np.sqrt(float(rep.d_X))
-        T_scaled = (T.view(-1) - t_mean) / t_std
-
-        logw = _safe_logw(T_scaled.numel())
+        logw = _safe_logw(int(rep.T.shape[0]))
 
         if T_eval_all.ndim == 2:
             T_eval = np.array(T_eval_all[rep_idx]).reshape(-1)
@@ -501,47 +533,20 @@ def main() -> None:
             T_eval = T_eval[:args.eval_n]
             mu_eval = mu_eval[:args.eval_n]
 
-        if h_type == "knn":
-            a_h = None
-            alpha = None
-        else:
-            a_h = float(np.exp(best_params["log_a_h"]))
-            alpha = float(fixed_params.get("alpha", best_params.get("alpha", 0.05)))
-
-        if t_transform == "cdf_sigmoid":
-            T_obs_np = transform_t_to_star(rep.T, tstar_params)
-            T_eval_np = transform_t_to_star(T_eval, tstar_params)
-        else:
-            T_obs_np = _apply_t_transform(rep.T, t_transform)
-            T_eval_np = _apply_t_transform(T_eval, t_transform)
-        t_mean_np = float(std["t_mean"])
-        t_std_np = float(std["t_std"])
-        T_obs_scaled = (T_obs_np.reshape(-1) - t_mean_np) / t_std_np
-        T_eval_scaled = (T_eval_np.reshape(-1) - t_mean_np) / t_std_np
+        T_obs_np = _apply_t_transform(rep.T, t_transform)
+        T_eval_np = _apply_t_transform(T_eval, t_transform)
 
         if args.plot_h and (args.plot_rep < 0 or int(rep.rep_idx) == int(args.plot_rep)):
             t_min = float(np.min(T_eval))
             t_max = float(np.max(T_eval))
             n_plot = int(max(10, args.plot_h_n))
             t_grid = np.linspace(t_min, t_max, n_plot)
-            if t_transform == "cdf_sigmoid":
-                t_grid_star = transform_t_to_star(t_grid, tstar_params)
-                t_grid_scaled = (t_grid_star.reshape(-1) - t_mean_np) / t_std_np
-            else:
-                t_grid_scaled = (_apply_t_transform(t_grid, t_transform).reshape(-1) - t_mean_np) / t_std_np
-            if h_type == "knn":
-                h_vals = _h_curve_knn(
-                    T_obs=np.asarray(T_obs_scaled, dtype=np.float64),
-                    t_grid=np.asarray(t_grid_scaled, dtype=np.float64),
-                    nn=float(nn_val),
-                )
-            else:
-                h_vals = _h_curve(
-                    T_obs=np.asarray(T_obs_scaled, dtype=np.float64),
-                    t_grid=np.asarray(t_grid_scaled, dtype=np.float64),
-                    a_h=a_h,
-                    alpha=alpha,
-                )
+            t_grid_t = _apply_t_transform(t_grid, t_transform)
+            h_vals = _h_curve_knn(
+                T_obs=np.asarray(T_obs_np, dtype=np.float64),
+                t_grid=np.asarray(t_grid_t, dtype=np.float64),
+                nn=float(nn_val),
+            )
             out_path = out_dir / f"h_curve_rep{rep.rep_idx:03d}.png"
             _save_h_plot(t_grid, h_vals, out_path)
             print(f"[INFO] Saved h(t) plot: {out_path}")
@@ -567,23 +572,15 @@ def main() -> None:
             )
             print(f"[INFO] Saved log1p(T_train) hist: {out_path_log}")
 
-        if h_type == "knn":
-            pred = estimate_adrf_local_poly_knn(
-                T_obs=np.asarray(T_obs_scaled, dtype=np.float64),
-                Y_obs=np.asarray(rep.Y, dtype=np.float64),
-                log_weights=np.asarray(logw, dtype=np.float64),
-                t_grid=np.asarray(T_eval_scaled, dtype=np.float64),
-                nn=float(nn_val),
-            )
-        else:
-            pred = estimate_adrf_local_poly(
-                T_obs=np.asarray(T_obs_scaled, dtype=np.float64),
-                Y_obs=np.asarray(rep.Y, dtype=np.float64),
-                log_weights=np.asarray(logw, dtype=np.float64),
-                t_grid=np.asarray(T_eval_scaled, dtype=np.float64),
-                a_h=a_h,
-                alpha=alpha,
-            )
+        pred = estimate_adrf_huling_local_poly(
+            T_obs=np.asarray(rep.T, dtype=np.float64),
+            Y_obs=np.asarray(rep.Y, dtype=np.float64),
+            weights=np.ones_like(rep.T, dtype=np.float64),
+            t_grid=np.asarray(T_eval, dtype=np.float64),
+            degree=degree,
+            nn=float(nn_val),
+            t_transform=t_transform,
+        )
 
         diff = pred - mu_eval
         mse = float(np.mean(diff ** 2))
@@ -616,23 +613,13 @@ def main() -> None:
             if args.debug_topk:
                 print("[DBG] t, h, denom, min_l, max_l, neg_cnt, ess, cond, mu_hat_dbg")
                 for i in idx:
-                    if h_type == "knn":
-                        dbg = _local_linear_debug_knn(
-                            T_obs=np.asarray(T_obs_scaled, dtype=np.float64),
-                            Y_obs=np.asarray(rep.Y, dtype=np.float64),
-                            logw=np.asarray(logw, dtype=np.float64),
-                            t0=float(T_eval_scaled[i]),
-                            nn=float(nn_val),
-                        )
-                    else:
-                        dbg = _local_linear_debug(
-                            T_obs=np.asarray(T_obs_scaled, dtype=np.float64),
-                            Y_obs=np.asarray(rep.Y, dtype=np.float64),
-                            logw=np.asarray(logw, dtype=np.float64),
-                            t0=float(T_eval_scaled[i]),
-                            a_h=a_h,
-                            alpha=alpha,
-                        )
+                    dbg = _local_linear_debug_knn(
+                        T_obs=np.asarray(T_obs_np, dtype=np.float64),
+                        Y_obs=np.asarray(rep.Y, dtype=np.float64),
+                        logw=np.asarray(logw, dtype=np.float64),
+                        t0=float(T_eval_np[i]),
+                        nn=float(nn_val),
+                    )
                     print(
                         f"{dbg['t']:.6g}, {dbg['h']:.6g}, {dbg['denom']:.6g}, "
                         f"{dbg['min_l']:.6g}, {dbg['max_l']:.6g}, {dbg['neg_cnt']}, "
