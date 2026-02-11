@@ -438,13 +438,25 @@ weighted_energy_stats <- function(A, X, weights,
 }
 
 # ------------------------------------------------------------
-# If run as a script, compute weights for ./rep000.csv
-# and save ./rep000_weights.csv in the current working directory.
+# If run as a script, compute weights for repXXX.csv in a given
+# directory and save repXXX_weights.csv in the same directory.
 # This block is skipped when the file is sourced by other scripts.
 # ------------------------------------------------------------
-run_rep000_weights <- function(csv_path = "E:/Dropbox/PC (2)/Downloads/260105/sim_huling_ntr1000_nev500_rpt100_mx1-0.5_mx21.0_mx30.3_ae1_seed42/rep000.csv",
-                               out_path = "E:/Dropbox/PC (2)/Downloads/260105/sim_huling_ntr1000_nev500_rpt100_mx1-0.5_mx21.0_mx30.3_ae1_seed42/rep000_weights.csv")
+get_arg <- function(flag, default = NULL, args = commandArgs(trailingOnly = TRUE)) {
+  key <- paste0("--", flag, "=")
+  hit <- args[startsWith(args, key)]
+  if (length(hit) == 0) return(default)
+  sub(key, "", hit[1])
+}
+
+run_rep_weights <- function(csv_dir = ".",
+                            rep = 0,
+                            out_dir = NULL)
 {
+  if (is.null(out_dir)) out_dir <- csv_dir
+  csv_path <- file.path(csv_dir, sprintf("rep%03d.csv", as.integer(rep)))
+  out_path <- file.path(out_dir, sprintf("rep%03d_weights.csv", as.integer(rep)))
+
   if (!file.exists(csv_path)) {
     stop(sprintf("File not found: %s (current dir: %s)", csv_path, getwd()))
   }
@@ -465,5 +477,9 @@ if (sys.nframe() == 0) {
   }
   # ensure solve_osqp is available (independence_weights uses it unqualified)
   solve_osqp <- osqp::solve_osqp
-  run_rep000_weights()
+  args <- commandArgs(trailingOnly = TRUE)
+  csv_dir <- get_arg("csv_dir", default = ".", args = args)
+  rep <- as.integer(get_arg("rep", default = "0", args = args))
+  out_dir <- get_arg("out_dir", default = NULL, args = args)
+  run_rep_weights(csv_dir = csv_dir, rep = rep, out_dir = out_dir)
 }
