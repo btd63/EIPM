@@ -58,6 +58,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max_reps", type=int, default=None)
     p.add_argument("--only_rep", type=int, default=None)
     p.add_argument("--top_k_errors", type=int, default=None)
+    p.add_argument("--out_csv", type=str, default=None, help="Save summary CSV to this path.")
+    p.add_argument("--out_md", type=str, default=None, help="Save summary Markdown to this path.")
     return p.parse_args()
 
 
@@ -140,6 +142,45 @@ def main() -> None:
     print(f"  BIAS_mean = c({fmt_list(bias)}),")
     print(f"  status = c({', '.join([repr(s) for s in status])})")
     print(")")
+
+    # Save outputs if requested (or default paths if not provided)
+    dataset_stem = Path(pattern).stem
+    suffix = ""
+    if args.only_rep is not None:
+        suffix = f"_rep{int(args.only_rep):03d}"
+    elif args.max_reps is not None:
+        suffix = f"_max{int(args.max_reps)}"
+
+    out_csv = Path(args.out_csv) if args.out_csv else Path("./results") / f"summary_{dataset_stem}{suffix}.csv"
+    out_md = Path(args.out_md) if args.out_md else Path("./results") / f"summary_{dataset_stem}{suffix}.md"
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    out_md.parent.mkdir(parents=True, exist_ok=True)
+
+    # CSV
+    import csv
+
+    with out_csv.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["method", "MSE_mean", "MAE_mean", "BIAS_mean", "status"])
+        for r in rows:
+            w.writerow([r["method"], r["MSE_mean"], r["MAE_mean"], r["BIAS_mean"], r["status"]])
+
+    # Markdown
+    def fmt(v):
+        return "NA" if v is None else f"{v:.6g}"
+
+    md_lines = [
+        "| method | MSE_mean | MAE_mean | BIAS_mean | status |",
+        "|---|---:|---:|---:|---|",
+    ]
+    for r in rows:
+        md_lines.append(
+            f"| {r['method']} | {fmt(r['MSE_mean'])} | {fmt(r['MAE_mean'])} | {fmt(r['BIAS_mean'])} | {r['status']} |"
+        )
+    out_md.write_text("\n".join(md_lines) + "\n")
+
+    print(f"[SAVED] {out_csv}")
+    print(f"[SAVED] {out_md}")
 
 
 if __name__ == "__main__":
