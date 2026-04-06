@@ -131,6 +131,42 @@ METHOD_DISPLAY_NAME: Dict[str, str] = {
     "koow_like": "KOOW",
 }
 
+DEFAULT_NMES_COVARIATES: List[str] = [
+    "lastage",
+    "agesmoke",
+    "male",
+    "race3",
+    "beltuse",
+    "educate",
+    "marital",
+    "sregion",
+    "povstalb",
+]
+
+PUBLIC_NMES_COLUMNS: List[str] = [
+    "packyears",
+    "totalexp",
+    "lastage",
+    "male",
+    "race3",
+    "beltuse",
+    "educate",
+    "marital",
+    "sregion",
+    "povstalb",
+]
+
+NMES_FORBIDDEN_COVARIATES = {
+    "packyears",
+    "totalexp",
+    "t",
+    "y",
+    "t_zero",
+    "a",
+    "a_zero",
+    "pidx",
+}
+
 # Methods that are intentionally excluded unless exact source/dependencies are available.
 UNAVAILABLE_METHOD_REASON: Dict[str, str] = {
     "cbgps": (
@@ -1102,10 +1138,60 @@ def load_nmes_dataframe(path: str | Path):
         raise FileNotFoundError(f"NMES file not found: {path}")
     suf = path.suffix.lower()
     if suf in [".csv", ".txt"]:
-        return pd.read_csv(path)
+        return normalize_nmes_dataframe(pd.read_csv(path))
     if suf in [".parquet", ".pq"]:
-        return pd.read_parquet(path)
+        return normalize_nmes_dataframe(pd.read_parquet(path))
     raise ValueError(f"Unsupported NMES file extension: {suf} (use CSV or Parquet)")
+
+
+def normalize_nmes_dataframe(df):
+    if pd is None:
+        raise ImportError("pandas is required for NMES preprocessing.")
+    if df is None:
+        raise ValueError("NMES dataframe is None.")
+
+    work = df.copy()
+    rename_map = {
+        "PIDX": "pidx",
+        "T": "t",
+        "Y": "y",
+        "T_zero": "t_zero",
+        "packyears": "packyears",
+        "TOTALEXP": "totalexp",
+        "LASTAGE": "lastage",
+        "AGESMOKE": "agesmoke",
+        "MALE": "male",
+        "RACE3": "race3",
+        "INCALPER": "incalper",
+        "beltuse": "beltuse",
+        "educate": "educate",
+        "marital": "marital",
+        "SREGION": "sregion",
+        "POVSTALB": "povstalb",
+        "lc5": "lc5",
+        "chd5": "chd5",
+        "HSQACCWT": "hsqaccwt",
+    }
+    work.columns = [rename_map.get(str(c), str(c).lower()) for c in work.columns]
+
+    missing = [c for c in ["packyears", "totalexp"] if c not in work.columns]
+    if missing:
+        raise KeyError(f"NMES columns missing: {missing}")
+
+    keep = [c for c in PUBLIC_NMES_COLUMNS if c in work.columns]
+    if "agesmoke" in work.columns and "agesmoke" not in keep:
+        keep.insert(keep.index("lastage") + 1 if "lastage" in keep else len(keep), "agesmoke")
+    if not keep:
+        raise ValueError("No usable NMES columns found after normalization.")
+    return work.loc[:, keep].copy()
+
+
+def choose_nmes_covariates(df) -> List[str]:
+    cols = [str(c) for c in df.columns]
+    preferred = [c for c in DEFAULT_NMES_COVARIATES if c in cols]
+    if preferred:
+        return preferred
+    return [c for c in cols if c not in NMES_FORBIDDEN_COVARIATES]
 
 
 def prepare_nmes_design(
