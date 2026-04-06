@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+
+기타/
+datasets/
+nmes_data/
+external_weights/
+models/
+results/
+
+*.npz
+*.pth
