@@ -3,13 +3,21 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
+import sys
 from typing import Dict, List
+
+ROOT = Path(__file__).resolve().parent.parent
+LIB_DIR = ROOT / "lib"
+RUN_DIR = ROOT / "run"
+for p in [str(LIB_DIR), str(RUN_DIR)]:
+    if p not in sys.path:
+        sys.path.insert(0, p)
 
 import numpy as np
 import pandas as pd
 
-from core.benchmark_core import make_repeated_subsample_indices, make_synthetic_outcome, predict_oracle_mu
-from core.table_helpers import (
+from benchmark_core import make_repeated_subsample_indices, make_synthetic_outcome, predict_oracle_mu
+from table_helpers import (
     clean_results_dir,
     estimate_semicont_curve_from_context,
     filter_supported_methods,
@@ -23,9 +31,6 @@ from core.table_helpers import (
     upsert_results_rows,
 )
 
-ROOT = Path(__file__).resolve().parent
-
-
 @dataclass
 class RepData:
     d_X: int
@@ -37,9 +42,9 @@ class RepData:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run NMES (1-rep adapter) and append per-method NW/LL results CSV rows.")
     p.add_argument("--nmes_path", type=str, default="")
-    p.add_argument("--results_dir", type=str, default=str(ROOT / "results"))
-    p.add_argument("--data_dir", type=str, default=str(ROOT / "datasets"))
-    p.add_argument("--models_dir", type=str, default=str(ROOT / "models" / "eipm_nmes"))
+    p.add_argument("--results_dir", type=str, default=str(ROOT / "out"))
+    p.add_argument("--data_dir", type=str, default=str(ROOT / "data"))
+    p.add_argument("--models_dir", type=str, default=str(ROOT / "out" / "models" / "eipm_nmes"))
     p.add_argument("--methods", type=str, default="eipm,stabilized_gps,cbgps,independence_weights")
     p.add_argument("--clip_max", type=float, default=1e4)
     p.add_argument("--seed", type=int, default=42)

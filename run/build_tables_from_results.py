@@ -2,12 +2,20 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import sys
 from typing import Dict, List, Tuple
+
+ROOT = Path(__file__).resolve().parent.parent
+LIB_DIR = ROOT / "lib"
+RUN_DIR = ROOT / "run"
+for p in [str(LIB_DIR), str(RUN_DIR)]:
+    if p not in sys.path:
+        sys.path.insert(0, p)
 
 import numpy as np
 
-from core.benchmark_core import METHOD_DISPLAY_NAME
-from core.table_helpers import (
+from benchmark_core import METHOD_DISPLAY_NAME
+from table_helpers import (
     MetricSummary,
     ensure_tables_dir,
     metric_cell,
@@ -17,12 +25,9 @@ from core.table_helpers import (
     write_sim_table_tex_dynamic,
 )
 
-ROOT = Path(__file__).resolve().parent
-
-
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Build tables from results_*.csv files only.")
-    p.add_argument("--results_dir", type=str, default=str(ROOT / "results"))
+    p.add_argument("--results_dir", type=str, default=str(ROOT / "out"))
     return p.parse_args()
 
 

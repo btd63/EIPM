@@ -2,11 +2,12 @@ __pycache__/
 *.pyc
 
 기타/
-datasets/
-nmes_data/
-external_weights/
-models/
-results/
+data/*.npz
+data/csv/
+data/external_weights/
+out/models/
+out/results_*.csv
+out/tables/
 
 *.npz
 *.pth

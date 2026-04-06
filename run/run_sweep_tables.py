@@ -2,9 +2,17 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import sys
 from typing import Dict, List, Tuple
 
-from core.table_helpers import (
+ROOT = Path(__file__).resolve().parent.parent
+LIB_DIR = ROOT / "lib"
+RUN_DIR = ROOT / "run"
+for p in [str(LIB_DIR), str(RUN_DIR)]:
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+from table_helpers import (
     MetricSummary,
     clean_results_dir,
     evaluate_sim_config_all_methods,
@@ -16,14 +24,11 @@ from core.table_helpers import (
     upsert_results_rows,
 )
 
-ROOT = Path(__file__).resolve().parent
-
-
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run simulation sweeps and store per-method results CSVs (NW/LL).")
-    p.add_argument("--results_dir", type=str, default=str(ROOT / "results"))
-    p.add_argument("--data_dir", type=str, default=str(ROOT / "datasets"))
-    p.add_argument("--models_dir", type=str, default=str(ROOT / "models" / "eipm_sweeps"))
+    p.add_argument("--results_dir", type=str, default=str(ROOT / "out"))
+    p.add_argument("--data_dir", type=str, default=str(ROOT / "data"))
+    p.add_argument("--models_dir", type=str, default=str(ROOT / "out" / "models" / "eipm_sweeps"))
     p.add_argument("--methods", type=str, default="eipm,stabilized_gps,cbgps,independence_weights")
     p.add_argument("--scenarios", type=str, default="linear,nonlinear")
     p.add_argument("--clip_max", type=float, default=1e4)

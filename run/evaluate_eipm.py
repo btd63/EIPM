@@ -4,22 +4,26 @@ import argparse
 import glob
 import os
 from pathlib import Path
+import sys
 from typing import Callable
 
 import numpy as np
 import torch
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+ROOT_DIR = SCRIPT_DIR.parent
+LIB_DIR = ROOT_DIR / "lib"
+if str(LIB_DIR) not in sys.path:
+    sys.path.insert(0, str(LIB_DIR))
+
 from device_utils import select_device
 from train_eipm import load_replications_from_npz, EIPM
 
-ROOT_DIR = Path(__file__).resolve().parent
-
-
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    p.add_argument("--data_dir", type=str, default=str(ROOT_DIR / "datasets"))
+    p.add_argument("--data_dir", type=str, default=str(ROOT_DIR / "data"))
     p.add_argument("--pattern", type=str, default="sim_*nonlinear*.npz")
-    p.add_argument("--ckpt_dir", type=str, default=str(ROOT_DIR / "models" / "eipm"))
+    p.add_argument("--ckpt_dir", type=str, default=str(ROOT_DIR / "out" / "models" / "eipm"))
     p.add_argument("--device", type=str, default="auto")
     p.add_argument("--degree", type=int, choices=[0, 1], default=1, help="Local polynomial degree (0=NW, 1=LL).")
     p.add_argument("--eval_n", type=int, default=0)

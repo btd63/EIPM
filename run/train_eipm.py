@@ -13,6 +13,7 @@ import argparse
 import glob
 import math
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -26,9 +27,14 @@ from sklearn.model_selection import KFold, StratifiedKFold
 from torch import Tensor
 from torch.nn.utils import clip_grad_norm_
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+ROOT_DIR = SCRIPT_DIR.parent
+LIB_DIR = ROOT_DIR / "lib"
+if str(LIB_DIR) not in sys.path:
+    sys.path.insert(0, str(LIB_DIR))
+
 from device_utils import select_device
 _T_TRANSFORM = "cdf_sigmoid"
-ROOT_DIR = Path(__file__).resolve().parent
 
 
 def _sigmoid(x: np.ndarray) -> np.ndarray:
@@ -1528,14 +1534,14 @@ def load_replications_from_npz(npz_path: str) -> List[ReplicationData]:
 def parse_args():
     p = argparse.ArgumentParser()
 
-    p.add_argument("--data_dir", type=str, default=str(ROOT_DIR / "datasets"))
+    p.add_argument("--data_dir", type=str, default=str(ROOT_DIR / "data"))
     p.add_argument(
         "--pattern",
         type=str,
         default="sim_nonlinear_dx50_ntr1000_nev10000_rpt100_tk50_ok50_pi0.0_seed42.npz",
         help="Dataset filename under data_dir.",
     )
-    p.add_argument("--out_dir", type=str, default=str(ROOT_DIR / "models" / "eipm"))
+    p.add_argument("--out_dir", type=str, default=str(ROOT_DIR / "out" / "models" / "eipm"))
     p.add_argument("--device", type=str, default="auto")
 
     # model / training

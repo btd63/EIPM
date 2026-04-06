@@ -17,7 +17,7 @@ from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
-from core.benchmark_core import UNAVAILABLE_METHOD_REASON, fit_method_weights, lognormal_pdf
+from benchmark_core import UNAVAILABLE_METHOD_REASON, fit_method_weights, lognormal_pdf
 from evaluate_eipm import transform_t_to_star
 from train_eipm import EIPM, load_replications_from_npz
 
@@ -128,11 +128,16 @@ def results_csv_path(results_dir: Path, method: str) -> Path:
 
 def clean_results_dir(results_dir: Path) -> None:
     results_dir.mkdir(parents=True, exist_ok=True)
+    removable_dirs = {"tables", "plots", "logs", "configs", "config"}
     for child in list(results_dir.iterdir()):
-        if child.is_dir():
+        if child.is_file():
+            name = child.name.lower()
+            if name.startswith("results_") and child.suffix.lower() == ".csv":
+                child.unlink(missing_ok=True)
+            elif child.suffix.lower() in {".json", ".md"} and ("result" in name or "config" in name):
+                child.unlink(missing_ok=True)
+        elif child.is_dir() and child.name in removable_dirs:
             shutil.rmtree(child)
-        else:
-            child.unlink(missing_ok=True)
 
 
 def ensure_tables_dir(results_dir: Path) -> Path:
@@ -492,7 +497,8 @@ def _find_rscript() -> str:
 
 
 def _find_cbgps_bridge_and_src() -> Tuple[Path, Path]:
-    code_dir = Path(__file__).resolve().parent
+    # table_helpers.py lives under code/core; resolve project code root.
+    code_dir = Path(__file__).resolve().parent.parent
     # Support both flat layout and "기타" archival layout.
     search_roots = [code_dir, code_dir / "기타"]
 
@@ -556,7 +562,7 @@ def _fit_cbgps_via_r_weights(
             "--seed",
             str(int(seed)),
         ]
-        proc = subprocess.run(cmd, cwd=str(Path(__file__).resolve().parent), check=False, capture_output=True, text=True)
+        proc = subprocess.run(cmd, cwd=str(Path(__file__).resolve().parent.parent), check=False, capture_output=True, text=True)
         if proc.returncode != 0:
             stderr = (proc.stderr or "").strip()
             stdout = (proc.stdout or "").strip()
@@ -1014,7 +1020,7 @@ def train_eipm_for_dataset(
 ) -> None:
     cmd = [
         sys.executable,
-        str(code_dir / "train_eipm.py"),
+        str(code_dir / "run" / "train_eipm.py"),
         "--data_dir",
         str(data_dir),
         "--pattern",
@@ -1061,7 +1067,7 @@ def generate_dgp_dataset(
 ) -> str:
     cmd = [
         sys.executable,
-        str(code_dir / "my_dgp.py"),
+        str(code_dir / "run" / "my_dgp.py"),
         "--scenario",
         str(scenario),
         "--d_X",
