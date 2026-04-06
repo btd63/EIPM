@@ -1,11 +1,4 @@
-# train_eipm_single.py
-#
-# Train EIPM on a SINGLE dataset:
-#   - first nonlinear npz (sorted order)
-#   - first replication (rep_idx = 0)
-#
-# Purpose:
-#   canonical train → evaluate pipeline bootstrap
+# train.py
 
 from __future__ import annotations
 
@@ -33,7 +26,7 @@ LIB_DIR = ROOT_DIR / "lib"
 if str(LIB_DIR) not in sys.path:
     sys.path.insert(0, str(LIB_DIR))
 
-from device_utils import select_device
+from gpu import select_device
 _T_TRANSFORM = "cdf_sigmoid"
 
 

@@ -16,8 +16,8 @@ LIB_DIR = ROOT_DIR / "lib"
 if str(LIB_DIR) not in sys.path:
     sys.path.insert(0, str(LIB_DIR))
 
-from device_utils import select_device
-from train_eipm import load_replications_from_npz, EIPM
+from gpu import select_device
+from train_base import load_replications_from_npz, EIPM
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()

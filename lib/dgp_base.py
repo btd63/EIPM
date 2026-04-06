@@ -1,4 +1,4 @@
-# my_dgp.py
+# dgp_base.py
 
 # import
 from __future__ import annotations

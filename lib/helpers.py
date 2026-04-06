@@ -17,9 +17,9 @@ from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
-from benchmark_core import UNAVAILABLE_METHOD_REASON, fit_method_weights, lognormal_pdf
-from evaluate_eipm import transform_t_to_star
-from train_eipm import EIPM, load_replications_from_npz
+from core import UNAVAILABLE_METHOD_REASON, fit_method_weights, lognormal_pdf
+from eval_base import transform_t_to_star
+from train_base import EIPM, load_replications_from_npz
 
 
 RESULT_COLUMNS: List[str] = [
@@ -497,7 +497,7 @@ def _find_rscript() -> str:
 
 
 def _find_cbgps_bridge_and_src() -> Tuple[Path, Path]:
-    # table_helpers.py lives under code/core; resolve project code root.
+    # helpers.py lives under code/lib; resolve project code root.
     code_dir = Path(__file__).resolve().parent.parent
     # Support both flat layout and "기타" archival layout.
     search_roots = [code_dir, code_dir / "기타"]
@@ -1020,7 +1020,7 @@ def train_eipm_for_dataset(
 ) -> None:
     cmd = [
         sys.executable,
-        str(code_dir / "run" / "train_eipm.py"),
+        str(code_dir / "lib" / "train_base.py"),
         "--data_dir",
         str(data_dir),
         "--pattern",
@@ -1067,7 +1067,7 @@ def generate_dgp_dataset(
 ) -> str:
     cmd = [
         sys.executable,
-        str(code_dir / "run" / "my_dgp.py"),
+        str(code_dir / "lib" / "dgp_base.py"),
         "--scenario",
         str(scenario),
         "--d_X",
